@@ -309,8 +309,17 @@ export default async function handler(req, res) {
     let context = "";
 
     if (intentData.intent === "product") {
-      let results = await categorySearch(intentData.search_query);
-      if (!results) { const catalog = await getCatalog(); results = keywordSearch(catalog, intentData.search_query); }
+      const q = (intentData.search_query || lastMsg || "").toLowerCase();
+      let results;
+      if (/\b(discount|discounted|sale|deal|deals|offer|offers|cheap|off)\b/.test(q)) {
+        // Customer wants discounted items — return products that actually have a discount
+        const catalog = await getCatalog();
+        results = catalog.filter((p) => p.discountPercent > 0)
+          .sort((a, b) => b.discountPercent - a.discountPercent).slice(0, 20);
+      } else {
+        results = await categorySearch(intentData.search_query);
+        if (!results) { const catalog = await getCatalog(); results = keywordSearch(catalog, intentData.search_query); }
+      }
       products = results || [];
       if (products.length) {
         context = `Found ${products.length} matching products. In ONE short line, say you found some options and ask which they'd like. Do NOT list them (the cards show below).`;
