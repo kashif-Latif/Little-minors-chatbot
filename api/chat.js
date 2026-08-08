@@ -1,4 +1,4 @@
-// api/chat.js — Little Minors "Mimi Bot" backend
+// api/chat.js — Little Minors "Bee Bot" backend
 //
 // SECURITY: No keys here. All secrets come from Vercel env vars.
 // Env vars: GROQ_API_KEY, SHOPIFY_STORE, SHOPIFY_ADMIN_TOKEN,
@@ -170,27 +170,44 @@ async function findOrderByNumber(orderId) {
   return { order: null };
 }
 
-async function lookupOrder({ orderId, name, phone, email }) {
+async function findOrderByContact(email, phone) {
+  // Needs read_customers scope. Searches customer by email/phone, returns latest order.
+  const parts = [];
+  if (email) parts.push(`email:${email}`);
+  if (phone) parts.push(`phone:${String(phone).replace(/\s/g, "")}`);
+  if (!parts.length) return { order: null };
+  try {
+    const url = `${storeBase()}/admin/api/2024-10/customers/search.json?query=${encodeURIComponent(parts.join(" OR "))}`;
+    const r = await fetch(url, { headers: shopHeaders() });
+    if (r.status === 403) return { error: "no_customer_scope" };
+    if (!r.ok) return { order: null };
+    const data = await r.json();
+    const customer = (data.customers || [])[0];
+    if (!customer) return { order: null };
+    const or = await fetch(`${storeBase()}/admin/api/2024-10/customers/${customer.id}/orders.json?status=any&limit=5`, { headers: shopHeaders() });
+    if (!or.ok) return { order: null };
+    const od = await or.json();
+    const order = (od.orders || [])[0];
+    return { order: order || null };
+  } catch (e) { return { order: null }; }
+}
+
+async function lookupOrder({ orderId, phone, email }) {
   if (!process.env.SHOPIFY_STORE || !process.env.SHOPIFY_ADMIN_TOKEN) return { ok: false, reason: "error" };
-  if (!orderId) return { ok: false, reason: "need_order_id" };
-  if (!name && !phone && !email) return { ok: false, reason: "need_identity" };
+  if (!orderId && !phone && !email) return { ok: false, reason: "need_any" };
 
-  const found = await findOrderByNumber(orderId);
-  if (found.error === "no_scope") return { ok: false, reason: "no_scope" };
-  const order = found.order;
+  let order = null;
+  if (orderId) {
+    const found = await findOrderByNumber(orderId);
+    if (found.error === "no_scope") return { ok: false, reason: "no_scope" };
+    order = found.order;
+  }
+  if (!order && (email || phone)) {
+    const r = await findOrderByContact(email, phone);
+    if (r.error === "no_customer_scope") return { ok: false, reason: "no_customer_scope" };
+    order = r.order;
+  }
   if (!order) return { ok: false, reason: "not_found" };
-
-  const oEmail = (order.email || "").toLowerCase().trim();
-  const cust = order.customer || {};
-  const ship = order.shipping_address || {};
-  const oName = `${cust.first_name || ""} ${cust.last_name || ""} ${ship.name || ""}`.toLowerCase();
-  const oPhones = [order.phone, ship.phone, cust.phone].map(normPhone).filter(Boolean);
-
-  let matched = false;
-  if (email && oEmail && email.toLowerCase().trim() === oEmail) matched = true;
-  if (phone && oPhones.includes(normPhone(phone))) matched = true;
-  if (name && oName && oName.includes(name.toLowerCase().trim())) matched = true;
-  if (!matched) return { ok: false, reason: "verify_failed" };
 
   const fulfilled = order.fulfillment_status === "fulfilled" || (order.fulfillments && order.fulfillments.length > 0);
   const items = (order.line_items || []).map((li) => li.title).slice(0, 5);
@@ -264,10 +281,9 @@ export default async function handler(req, res) {
       }
       const msg = {
         no_scope: "Order tracking isn't switched on yet. Please message us on WhatsApp and we'll check for you.",
-        need_order_id: "Please enter your order number.",
-        need_identity: "Please add your name, phone, or email to verify the order.",
-        not_found: "I couldn't find that order number. Please double-check it.",
-        verify_failed: "Those details don't match this order. Please check the name, phone, or email used at checkout.",
+        no_customer_scope: "Searching by phone/email isn't enabled. Please enter your order number instead.",
+        need_any: "Please enter your order number, phone, or email.",
+        not_found: "I couldn't find an order with those details. Please double-check and try again.",
         error: "I couldn't check the order right now. Please try again shortly.",
       }[r.reason] || "I couldn't check the order right now.";
       return res.status(200).json({ reply: msg, order: null, showCarriers: true, whatsappNumber: waNumber, callNumber });
@@ -338,7 +354,7 @@ export default async function handler(req, res) {
 }
 
 async function shortReply(messages, context) {
-  const SYSTEM = `You are Mimi Bot, a warm assistant for Little Minors, a baby & kids store in Pakistan.
+  const SYSTEM = `You are Bee Bot, a warm assistant for Little Minors, a baby & kids store in Pakistan.
 - Reply in the SAME language the customer used (English/Urdu/Roman Urdu).
 - ALWAYS answer in ONE short line. Never write long paragraphs or lists.
 - Never invent products, prices, or order info.`;
