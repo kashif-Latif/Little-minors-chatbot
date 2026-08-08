@@ -150,7 +150,24 @@ const SYNONYMS = {
   feeder: ["feeder", "feeding", "bottle"],
   drone: ["drone", "aircraft", "plane"],
   fan: ["fan"],
+  jersey: ["jersy", "jersey", "tracksuit"],
+  jerseys: ["jersy", "jersey", "tracksuit"],
+  knickers: ["nicker", "shorts"],
+  knicker: ["nicker", "shorts"],
+  nicker: ["nicker", "shorts"],
+  kurti: ["kurta"],
+  socks: ["socks", "sock"],
 };
+
+// The core "product type" words in the catalog. If a query names one of these,
+// results are filtered to that type (so "boys pants" won't show shirts).
+const PRODUCT_NOUNS = new Set([
+  "romper", "bodysuit", "onesie", "trouser", "trousers", "pant", "pants", "shorts", "short",
+  "shirt", "shirts", "tee", "tshirt", "tracksuit", "suit", "outfit", "dress", "kurta", "kurti",
+  "jersy", "jersey", "nicker", "pacifier", "soother", "teether", "feeder", "bottle", "feeding",
+  "brush", "bib", "fan", "fans", "drone", "aircraft", "car", "kit", "grooming", "blanket",
+  "mittens", "cap", "pajama", "sleepwear", "toy", "sipper", "diaper",
+]);
 
 function expandSynonyms(kws) {
   const out = new Set(kws);
@@ -233,7 +250,11 @@ function keywordSearch(catalog, query) {
   kws = expandSynonyms(kws);
   kws = fuzzyExpand(kws, getVocab(catalog));   // typo tolerance + synonyms
   if (!kws.length && !packPhrase) return [];
-  const scored = catalog.map((p) => {
+
+  // If the customer named product type(s), we'll require results to match one of them
+  const nounKws = kws.filter((k) => PRODUCT_NOUNS.has(k));
+
+  let scored = catalog.map((p) => {
     const title = p.title.toLowerCase().replace(/\s+/g, " ");
     let score = 0;
     if (packPhrase && title.includes(packPhrase)) score += 6;
@@ -243,8 +264,16 @@ function keywordSearch(catalog, query) {
       else if (p._text.includes(kw)) score += 1;
     }
     return { p, score };
-  }).filter((x) => x.score > 0)
-    .sort((a, b) => (b.score - a.score) || ((b.p.available === true) - (a.p.available === true)));
+  }).filter((x) => x.score > 0);
+
+  // Keep only the requested product type (so "boys pants" doesn't show shirts)
+  if (nounKws.length) {
+    scored = scored.filter((x) =>
+      nounKws.some((n) => x.p.title.toLowerCase().includes(n) || x.p._text.includes(n))
+    );
+  }
+
+  scored.sort((a, b) => (b.score - a.score) || ((b.p.available === true) - (a.p.available === true)));
   return scored.slice(0, 20).map((x) => x.p);
 }
 
@@ -252,6 +281,33 @@ function keywordSearch(catalog, query) {
 function packSearch(catalog, phrase) {
   const norm = phrase.toLowerCase().replace(/\s+/g, " ");
   return catalog.filter((p) => p.title.toLowerCase().replace(/\s+/g, " ").includes(norm)).slice(0, 20);
+}
+
+// AI-powered matching: the model reads the full catalog and picks products for ANY query.
+// Understands synonyms, misspellings, phonetics, product types — no fixed keyword rules.
+async function aiPickProducts(catalog, query) {
+  if (!query || !catalog.length) return null;
+  const list = catalog.slice(0, 250).map((p, i) => `${i}: ${p.title}`).join("\n");
+  const prompt = `A customer of a baby & kids store said: "${query}"
+
+From the product list below, return ONLY a JSON array of the index numbers of products that genuinely match what the customer wants. Rules:
+- Understand synonyms, misspellings, phonetic errors, product types, ages, colours, and pack sizes.
+- If the customer names a product type (e.g. pants/trousers, shirt, romper, fan), include ONLY that type — do not include unrelated types.
+- Order by best match first. Max 15 indexes.
+- If nothing genuinely matches, return [].
+No text, no markdown, just the JSON array.
+
+Products:
+${list}`;
+  try {
+    const raw = await groqCall([{ role: "user", content: prompt }], { temperature: 0, max_tokens: 150 });
+    const clean = raw.replace(/```json/gi, "").replace(/```/g, "").trim();
+    const match = clean.match(/\[[\s\S]*\]/);
+    const arr = JSON.parse(match ? match[0] : clean);
+    if (!Array.isArray(arr)) return null;
+    const picked = arr.map((i) => catalog[Number(i)]).filter(Boolean);
+    return picked;
+  } catch (e) { return null; }
 }
 
 // ---- Order lookup (order number w/ #LM prefix + identity verification) ----
@@ -341,19 +397,31 @@ async function groqCall(messages, opts) {
 
 async function detectIntent(messages) {
   const convo = messages.slice(-6).map((m) => `${m.role}: ${m.content}`).join("\n");
-  const prompt = `You are the intent classifier for Little Minors, a baby & kids store.
+  const NOUNS = "romper, bodysuit, onesie, trouser, pant, shorts, shirt, tee, tracksuit, jersy (jersey), suit, outfit, dress, kurta, nicker, pacifier, soother, teether, feeder, feeding bottle, bottle, brush, bib, fan, drone, aircraft, rc car, car, grooming kit, kit, blanket, mittens, cap, pajama, sleepwear, toy, romper, independence day, 14 august";
+  const prompt = `You are the intent classifier + search normalizer for Little Minors, a baby & kids store in Pakistan.
 Classify the LAST customer message. Return ONLY JSON, no markdown:
 {"intent":"product|order_status|talk_to_agent|place_order|greeting|other","search_query":""}
-- "product": looking for/asking about items. Put clean search/category words (e.g. "azadi sale","boys jeans","baby bottle") in search_query.
+
+For "product" intent, build search_query using the store's product words below. IMPORTANT:
+- Fix spelling and phonetic errors and map to the closest store word. Examples: "rumor"->"romper", "tracsuit"->"tracksuit", "jersey"->"jersy", "trowser"->"trouser", "pacifer"->"pacifier".
+- Map synonyms to store words: "jeans"->"trouser", "frock"->"dress", "onesie/jumpsuit"->"romper bodysuit", "dummy/soother"->"pacifier".
+- Keep useful attributes (boys, girls, baby, colors, "14 august", "pack of 5") but drop filler words.
+- Only output words that describe the product they want.
+
+Store product words: ${NOUNS}
+
+Intents:
+- "product": looking for/asking about an item to buy.
 - "order_status": wants to track/check an order.
-- "talk_to_agent": wants a human/agent/support/complaint, or asks for phone number.
+- "talk_to_agent": wants a human/agent/support, or asks for our number.
 - "place_order": explicitly wants to order/buy now.
 - "greeting": hi/hello/salaam/thanks only.
 - "other": unclear/gibberish (e.g. "ss") or general question with no product. Never guess a product here.
+
 Conversation:
 ${convo}`;
   try {
-    const raw = await groqCall([{ role: "user", content: prompt }], { temperature: 0, max_tokens: 100 });
+    const raw = await groqCall([{ role: "user", content: prompt }], { temperature: 0, max_tokens: 120 });
     const clean = raw.replace(/```json/gi, "").replace(/```/g, "").trim();
     const p = JSON.parse(clean);
     return { intent: p.intent || "other", search_query: p.search_query || "" };
@@ -403,8 +471,8 @@ export default async function handler(req, res) {
     const lastMsg = ([...messages].reverse().find((m) => m.role === "user") || {}).content || "";
 
     // Open/check + exchange policy shortcut
-    if (/\b(open|khol|kholna|khool|check the product|exchange|return|refund|replace|replacement|policy|7 ?days?|wapas|badal)\b/i.test(lastMsg)) {
-      const reply = await shortReply(messages, "Customer asks about opening/checking the product or the exchange policy. Tell them warmly in one or two lines: yes, they can open and check the product on delivery, and exchange it within 7 days if there's any issue.");
+    if (/\b(open|khol|kholna|khool|check the product|exchange|return|returns|refund|replace|replacement|policy|7 ?days?|wapas|badal)\b/i.test(lastMsg)) {
+      const reply = await shortReply(messages, "Customer asks about opening/checking the product, returns, refunds, or exchange. State clearly and warmly in one or two lines: they can open and check the product on delivery, and we offer a 7-day EXCHANGE only. We do NOT offer returns or refunds — exchange within 7 days only if there's an issue. Do not say we have a return policy.");
       return res.status(200).json({ reply, products: [], action: "none", whatsappNumber: waNumber });
     }
 
@@ -438,8 +506,14 @@ export default async function handler(req, res) {
         results = catalog.filter((p) => p.discountPercent > 0)
           .sort((a, b) => b.discountPercent - a.discountPercent).slice(0, 20);
       } else {
+        // General query: try collections first, then AI matching, then keyword fallback
         results = await categorySearch(intentData.search_query);
-        if (!results) { const catalog = await getCatalog(); results = keywordSearch(catalog, intentData.search_query); }
+        if (!results) {
+          const catalog = await getCatalog();
+          const query = intentData.search_query || lastMsg;
+          results = await aiPickProducts(catalog, query);          // AI reads catalog, picks matches
+          if (!results || !results.length) results = keywordSearch(catalog, query); // fallback
+        }
       }
       products = results || [];
       // Only show IN-STOCK products
