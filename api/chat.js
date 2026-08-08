@@ -1,15 +1,8 @@
-// api/chat.js
-// Little Minors AI chatbot backend — "Mimi Bot"
+// api/chat.js — Little Minors "Mimi Bot" backend
 //
-// SECURITY: No keys in this file. All secrets come from Vercel env vars.
-//
-// Required Vercel Environment Variables:
-//   GROQ_API_KEY        - your Groq API key
-//   SHOPIFY_STORE       - e.g. 45e8a2-44.myshopify.com
-//   SHOPIFY_ADMIN_TOKEN - Admin API token (needs read_products, read_inventory, read_orders)
-//   WHATSAPP_NUMBER     - digits only, international, e.g. 923018481401
-//   PUBLIC_DOMAIN       - e.g. https://littleminors.com
-//   ALLOWED_ORIGIN      - e.g. https://littleminors.com  (use * while testing)
+// SECURITY: No keys here. All secrets come from Vercel env vars.
+// Env vars: GROQ_API_KEY, SHOPIFY_STORE, SHOPIFY_ADMIN_TOKEN,
+//           WHATSAPP_NUMBER (e.g. 923018481401), PUBLIC_DOMAIN, ALLOWED_ORIGIN
 
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_MODEL = "llama-3.3-70b-versatile";
@@ -20,155 +13,201 @@ function setCors(res) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
-// ---- Catalog: ACTIVE + PUBLISHED only (removes draft/old products) ----
-let CATALOG = null;
-let CATALOG_TIME = 0;
-const CATALOG_TTL = 5 * 60 * 1000;
+function shopHeaders() {
+  return { "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN, "Content-Type": "application/json" };
+}
+function storeBase() { return `https://${process.env.SHOPIFY_STORE}`; }
+
+function mapProduct(p) {
+  const variant = (p.variants && p.variants[0]) || {};
+  const image = (p.image && p.image.src) || (p.images && p.images[0] && p.images[0].src) || "";
+  const price = parseFloat(variant.price || "0");
+  const compareAt = parseFloat(variant.compare_at_price || "0");
+  const hasDiscount = compareAt > price && price > 0;
+  return {
+    title: p.title || "",
+    handle: p.handle || "",
+    price: variant.price || "",
+    compareAtPrice: hasDiscount ? variant.compare_at_price : "",
+    discountPercent: hasDiscount ? Math.round((1 - price / compareAt) * 100) : 0,
+    available: (variant.inventory_quantity || 0) > 0,
+    image,
+    url: `${storeBase()}/products/${p.handle}`,
+    _text: `${p.title || ""} ${p.product_type || ""} ${p.tags || ""} ${p.vendor || ""}`.toLowerCase(),
+  };
+}
+
+// ---- Full catalog cache (active + published) ----
+let CATALOG = null, CATALOG_TIME = 0;
+const TTL = 5 * 60 * 1000;
 
 async function getCatalog() {
   const now = Date.now();
-  if (CATALOG && now - CATALOG_TIME < CATALOG_TTL) return CATALOG;
-  const store = process.env.SHOPIFY_STORE;
-  const token = process.env.SHOPIFY_ADMIN_TOKEN;
-  if (!store || !token) return [];
-
-  const storeBase = `https://${store}`;
+  if (CATALOG && now - CATALOG_TIME < TTL) return CATALOG;
+  if (!process.env.SHOPIFY_STORE || !process.env.SHOPIFY_ADMIN_TOKEN) return [];
   let all = [];
-  let url = `https://${store}/admin/api/2024-10/products.json?limit=250&status=active&published_status=published`;
-
+  let url = `${storeBase()}/admin/api/2024-10/products.json?limit=250&status=active&published_status=published`;
   try {
-    for (let page = 0; page < 4 && url; page++) {
-      const r = await fetch(url, {
-        headers: { "X-Shopify-Access-Token": token, "Content-Type": "application/json" },
-      });
+    for (let i = 0; i < 6 && url; i++) {
+      const r = await fetch(url, { headers: shopHeaders() });
       if (!r.ok) break;
       const data = await r.json();
-      const products = (data.products || [])
+      all = all.concat((data.products || [])
         .filter((p) => (p.status ? p.status === "active" : true) && p.published_at)
-        .map((p) => {
-          const variant = (p.variants && p.variants[0]) || {};
-          const image = (p.image && p.image.src) || (p.images && p.images[0] && p.images[0].src) || "";
-          const price = parseFloat(variant.price || "0");
-          const compareAt = parseFloat(variant.compare_at_price || "0");
-          const hasDiscount = compareAt > price && price > 0;
-          const discountPercent = hasDiscount ? Math.round((1 - price / compareAt) * 100) : 0;
-          return {
-            title: p.title || "",
-            handle: p.handle || "",
-            price: variant.price || "",
-            compareAtPrice: hasDiscount ? variant.compare_at_price : "",
-            discountPercent,
-            available: (variant.inventory_quantity || 0) > 0,
-            image,
-            url: `${storeBase}/products/${p.handle}`,
-            _text: `${p.title || ""} ${p.product_type || ""} ${p.tags || ""} ${p.vendor || ""}`.toLowerCase(),
-          };
-        });
-      all = all.concat(products);
+        .map(mapProduct));
       const link = r.headers.get("link") || r.headers.get("Link");
       const next = link && link.match(/<([^>]+)>;\s*rel="next"/);
       url = next ? next[1] : null;
     }
-  } catch (e) {
-    return CATALOG || [];
+  } catch (e) { return CATALOG || []; }
+  CATALOG = all; CATALOG_TIME = now; return all;
+}
+
+// ---- Collections cache (for category requests like "Azadi Sale") ----
+let COLLECTIONS = null, COLL_TIME = 0;
+async function getCollections() {
+  const now = Date.now();
+  if (COLLECTIONS && now - COLL_TIME < TTL) return COLLECTIONS;
+  if (!process.env.SHOPIFY_STORE || !process.env.SHOPIFY_ADMIN_TOKEN) return [];
+  const out = [];
+  for (const type of ["custom_collections", "smart_collections"]) {
+    try {
+      const r = await fetch(`${storeBase()}/admin/api/2024-10/${type}.json?limit=250`, { headers: shopHeaders() });
+      if (!r.ok) continue;
+      const data = await r.json();
+      (data[type] || []).forEach((c) => out.push({ id: c.id, title: (c.title || "").toLowerCase() }));
+    } catch (e) {}
   }
-  CATALOG = all;
-  CATALOG_TIME = now;
+  COLLECTIONS = out; COLL_TIME = now; return out;
+}
+
+async function productsInCollection(collectionId) {
+  let all = [];
+  let url = `${storeBase()}/admin/api/2024-10/products.json?collection_id=${collectionId}&limit=250&status=active&published_status=published`;
+  try {
+    for (let i = 0; i < 4 && url; i++) {
+      const r = await fetch(url, { headers: shopHeaders() });
+      if (!r.ok) break;
+      const data = await r.json();
+      all = all.concat((data.products || [])
+        .filter((p) => (p.status ? p.status === "active" : true) && p.published_at)
+        .map(mapProduct));
+      const link = r.headers.get("link") || r.headers.get("Link");
+      const next = link && link.match(/<([^>]+)>;\s*rel="next"/);
+      url = next ? next[1] : null;
+    }
+  } catch (e) {}
   return all;
 }
 
-function keywords(text) {
-  const STOP = new Set([
-    "the","a","an","do","you","have","any","i","want","need","looking","for","me","show","some",
-    "is","are","there","can","get","buy","please","of","to","in","on","and","with","my","your",
-    "it","this","that","would","like","give","tell","about","product","products","item","items",
-  ]);
-  return (text || "")
-    .toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ").split(/\s+/)
-    .filter((w) => w.length > 2 && !STOP.has(w));
+const STOP = new Set(["the","a","an","do","you","have","any","i","want","need","looking","for","me",
+  "show","some","is","are","there","can","get","buy","please","of","to","in","on","and","with","my",
+  "your","it","this","that","would","like","give","tell","about","product","products","item","items",
+  "sale","kids","kid"]);
+
+function tokens(text) {
+  return (text || "").toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ").split(/\s+/).filter((w) => w.length > 2 || /^\d+$/.test(w));
+}
+function keywords(text) { return tokens(text).filter((w) => !STOP.has(w)); }
+
+// Try to match the query to a collection; return its products if found
+async function categorySearch(query) {
+  const qToks = tokens(query);
+  if (!qToks.length) return null;
+  const cols = await getCollections();
+  let best = null, bestScore = 0;
+  for (const c of cols) {
+    const cToks = tokens(c.title);
+    let score = 0;
+    for (const t of qToks) if (cToks.includes(t)) score += 2;
+    // also substring (e.g. "azadi" in "azadi sale")
+    for (const t of qToks) if (c.title.includes(t) && !cToks.includes(t)) score += 1;
+    if (score > bestScore) { bestScore = score; best = c; }
+  }
+  if (best && bestScore >= 2) {
+    const prods = await productsInCollection(best.id);
+    if (prods.length) return prods.slice(0, 30);
+  }
+  return null;
 }
 
-function searchCatalog(catalog, query) {
+function keywordSearch(catalog, query) {
+  const q = (query || "").toLowerCase().trim();
+  const packPhrase = (q.match(/pack of\s*\d+/) || [])[0];        // e.g. "pack of 3"
   const kws = keywords(query);
-  if (kws.length === 0) return [];
-  const scored = catalog
-    .map((p) => {
-      let score = 0;
-      for (const kw of kws) {
-        if (p.title.toLowerCase().includes(kw)) score += 3;
-        else if (p._text.includes(kw)) score += 1;
-      }
-      return { p, score };
-    })
-    .filter((x) => x.score > 0)
+  if (!kws.length && !packPhrase) return [];
+  const scored = catalog.map((p) => {
+    const title = p.title.toLowerCase().replace(/\s+/g, " ");
+    let score = 0;
+    if (packPhrase && title.includes(packPhrase)) score += 6;   // strongest: exact pack size
+    if (q && title.includes(q)) score += 4;                      // full phrase match
+    for (const kw of kws) {
+      if (title.includes(kw)) score += 3;
+      else if (p._text.includes(kw)) score += 1;
+    }
+    return { p, score };
+  }).filter((x) => x.score > 0)
     .sort((a, b) => (b.score - a.score) || ((b.p.available === true) - (a.p.available === true)));
-  return scored.slice(0, 6).map((x) => x.p);
+  return scored.slice(0, 20).map((x) => x.p);
 }
 
-// ---- Phone normalize: compare last 10 digits ----
-function normPhone(v) {
-  const d = String(v || "").replace(/\D/g, "");
-  return d.length > 10 ? d.slice(-10) : d;
+// ---- Order lookup (order number w/ #LM prefix + identity verification) ----
+function normPhone(v) { const d = String(v || "").replace(/\D/g, ""); return d.length > 10 ? d.slice(-10) : d; }
+
+async function findOrderByNumber(orderId) {
+  const digits = String(orderId).replace(/[^0-9]/g, "");
+  const candidates = [`LM${digits}`, `#LM${digits}`, digits, String(orderId)];
+  for (const name of candidates) {
+    try {
+      const url = `${storeBase()}/admin/api/2024-10/orders.json?status=any&name=${encodeURIComponent(name)}`;
+      const r = await fetch(url, { headers: shopHeaders() });
+      if (r.status === 403) return { error: "no_scope" };
+      if (!r.ok) continue;
+      const data = await r.json();
+      if (data.orders && data.orders.length) return { order: data.orders[0] };
+    } catch (e) {}
+  }
+  return { order: null };
 }
 
-// ---- Order lookup: locate by order number, verify with name/phone/email ----
-// Requires order number PLUS at least one matching identity field.
 async function lookupOrder({ orderId, name, phone, email }) {
-  const store = process.env.SHOPIFY_STORE;
-  const token = process.env.SHOPIFY_ADMIN_TOKEN;
-  if (!store || !token) return { ok: false, reason: "error" };
+  if (!process.env.SHOPIFY_STORE || !process.env.SHOPIFY_ADMIN_TOKEN) return { ok: false, reason: "error" };
   if (!orderId) return { ok: false, reason: "need_order_id" };
   if (!name && !phone && !email) return { ok: false, reason: "need_identity" };
 
-  const num = String(orderId).replace(/[^0-9]/g, "");
-  const url = `https://${store}/admin/api/2024-10/orders.json?status=any&name=${encodeURIComponent(num)}`;
+  const found = await findOrderByNumber(orderId);
+  if (found.error === "no_scope") return { ok: false, reason: "no_scope" };
+  const order = found.order;
+  if (!order) return { ok: false, reason: "not_found" };
 
-  try {
-    const r = await fetch(url, {
-      headers: { "X-Shopify-Access-Token": token, "Content-Type": "application/json" },
-    });
-    if (r.status === 403) return { ok: false, reason: "no_scope" };
-    if (!r.ok) return { ok: false, reason: "error" };
-    const data = await r.json();
-    const order = (data.orders || [])[0];
-    if (!order) return { ok: false, reason: "not_found" };
+  const oEmail = (order.email || "").toLowerCase().trim();
+  const cust = order.customer || {};
+  const ship = order.shipping_address || {};
+  const oName = `${cust.first_name || ""} ${cust.last_name || ""} ${ship.name || ""}`.toLowerCase();
+  const oPhones = [order.phone, ship.phone, cust.phone].map(normPhone).filter(Boolean);
 
-    // Gather identity fields from the order
-    const oEmail = (order.email || "").toLowerCase().trim();
-    const cust = order.customer || {};
-    const ship = order.shipping_address || {};
-    const oName = `${cust.first_name || ""} ${cust.last_name || ""} ${ship.name || ""}`.toLowerCase();
-    const oPhones = [order.phone, ship.phone, cust.phone].map(normPhone).filter(Boolean);
+  let matched = false;
+  if (email && oEmail && email.toLowerCase().trim() === oEmail) matched = true;
+  if (phone && oPhones.includes(normPhone(phone))) matched = true;
+  if (name && oName && oName.includes(name.toLowerCase().trim())) matched = true;
+  if (!matched) return { ok: false, reason: "verify_failed" };
 
-    // Verify: at least one provided identity field matches
-    let matched = false;
-    if (email && oEmail && email.toLowerCase().trim() === oEmail) matched = true;
-    if (phone && oPhones.includes(normPhone(phone))) matched = true;
-    if (name && oName && oName.includes(name.toLowerCase().trim())) matched = true;
-
-    if (!matched) return { ok: false, reason: "verify_failed" };
-
-    const items = (order.line_items || []).map((li) => li.title).slice(0, 5);
-    const tracking =
-      (order.fulfillments && order.fulfillments[0] && order.fulfillments[0].tracking_url) || "";
-    return {
-      ok: true,
-      order: {
-        name: order.name,
-        financial_status: order.financial_status,          // paid / pending
-        fulfillment_status: order.fulfillment_status || "unfulfilled", // fulfilled / null
-        tracking_url: tracking,
-        items,
-        created_at: order.created_at,
-      },
-    };
-  } catch (e) {
-    return { ok: false, reason: "error" };
-  }
+  const fulfilled = order.fulfillment_status === "fulfilled" || (order.fulfillments && order.fulfillments.length > 0);
+  const items = (order.line_items || []).map((li) => li.title).slice(0, 5);
+  return {
+    ok: true,
+    order: {
+      name: order.name,
+      financial_status: order.financial_status,
+      fulfillment_status: order.fulfillment_status || "unfulfilled",
+      shipped: !!fulfilled,
+      items,
+    },
+  };
 }
 
 async function groqCall(messages, opts) {
-  const { temperature = 0.5, max_tokens = 300 } = opts || {};
+  const { temperature = 0.5, max_tokens = 200 } = opts || {};
   const r = await fetch(GROQ_URL, {
     method: "POST",
     headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}`, "Content-Type": "application/json" },
@@ -182,27 +221,22 @@ async function groqCall(messages, opts) {
 async function detectIntent(messages) {
   const convo = messages.slice(-6).map((m) => `${m.role}: ${m.content}`).join("\n");
   const prompt = `You are the intent classifier for Little Minors, a baby & kids store.
-Classify the LAST customer message. Return ONLY valid JSON, no markdown:
+Classify the LAST customer message. Return ONLY JSON, no markdown:
 {"intent":"product|order_status|talk_to_agent|place_order|greeting|other","search_query":""}
-
-Rules:
-- "product": looking for/asking about an item. Put clean search words in search_query. Ignore filler.
-- "order_status": wants to track/check an existing order.
-- "talk_to_agent": wants a human/agent/support/complaint.
+- "product": looking for/asking about items. Put clean search/category words (e.g. "azadi sale","boys jeans","baby bottle") in search_query.
+- "order_status": wants to track/check an order.
+- "talk_to_agent": wants a human/agent/support/complaint, or asks for phone number.
 - "place_order": explicitly wants to order/buy now.
-- "greeting": hi/hello/salaam/thanks, no request.
-- "other": unclear, gibberish (like "ss"), or general question with no product. Never guess a product here.
-
+- "greeting": hi/hello/salaam/thanks only.
+- "other": unclear/gibberish (e.g. "ss") or general question with no product. Never guess a product here.
 Conversation:
 ${convo}`;
   try {
-    const raw = await groqCall([{ role: "user", content: prompt }], { temperature: 0, max_tokens: 120 });
+    const raw = await groqCall([{ role: "user", content: prompt }], { temperature: 0, max_tokens: 100 });
     const clean = raw.replace(/```json/gi, "").replace(/```/g, "").trim();
-    const parsed = JSON.parse(clean);
-    return { intent: parsed.intent || "other", search_query: parsed.search_query || "" };
-  } catch (e) {
-    return { intent: "other", search_query: "" };
-  }
+    const p = JSON.parse(clean);
+    return { intent: p.intent || "other", search_query: p.search_query || "" };
+  } catch (e) { return { intent: "other", search_query: "" }; }
 }
 
 export default async function handler(req, res) {
@@ -211,30 +245,32 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   const waNumber = process.env.WHATSAPP_NUMBER || "";
+  const callNumber = waNumber ? `+${waNumber}` : "";
 
   try {
     const body = req.body || {};
 
-    // ---- Direct order-tracking submission from the tracking form ----
+    // ---- Verified order tracking from the tracking form ----
     if (body.track) {
       const r = await lookupOrder(body.track);
       if (r.ok) {
         const itemsLine = r.order.items.length ? ` (${r.order.items.join(", ")})` : "";
+        const status = r.order.shipped ? "shipped" : (r.order.fulfillment_status || "processing");
         return res.status(200).json({
-          reply: `Order ${r.order.name}${itemsLine} — payment: ${r.order.financial_status}, delivery: ${r.order.fulfillment_status}.`,
+          reply: `Order ${r.order.name}${itemsLine} — payment: ${r.order.financial_status}, status: ${status}.`,
           order: r.order,
           whatsappNumber: waNumber,
         });
       }
       const msg = {
-        no_scope: "Order tracking isn't enabled yet. Please contact us on WhatsApp and we'll check for you.",
+        no_scope: "Order tracking isn't switched on yet. Please message us on WhatsApp and we'll check for you.",
         need_order_id: "Please enter your order number.",
-        need_identity: "Please add your name, phone, or email so I can verify it's your order.",
-        not_found: "I couldn't find an order with that number. Please double-check it.",
+        need_identity: "Please add your name, phone, or email to verify the order.",
+        not_found: "I couldn't find that order number. Please double-check it.",
         verify_failed: "Those details don't match this order. Please check the name, phone, or email used at checkout.",
         error: "I couldn't check the order right now. Please try again shortly.",
       }[r.reason] || "I couldn't check the order right now.";
-      return res.status(200).json({ reply: msg, order: null, whatsappNumber: waNumber });
+      return res.status(200).json({ reply: msg, order: null, showCarriers: true, whatsappNumber: waNumber, callNumber });
     }
 
     const { messages } = body;
@@ -242,53 +278,54 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "messages array required" });
     }
 
+    const lastMsg = ([...messages].reverse().find((m) => m.role === "user") || {}).content || "";
+
+    // Quick carrier shortcut
+    if (/\b(postex|ownexpress|own express|courier|carrier)\b/i.test(lastMsg)) {
+      const reply = await shortReply(messages, "Customer asks about the courier/carrier. Tell them we ship via PostEx and OwnExpress, and they can track using the buttons below.");
+      return res.status(200).json({ reply, products: [], action: "none", showCarriers: true, whatsappNumber: waNumber });
+    }
+
     const intentData = await detectIntent(messages);
     let products = [];
     let action = "none";
-    let contextForReply = "";
+    let showCall = false;
+    let context = "";
 
     if (intentData.intent === "product") {
-      const catalog = await getCatalog();
-      products = searchCatalog(catalog, intentData.search_query);
-      contextForReply = products.length
-        ? `Matching products (recommend ONLY these, mention discounts if any):\n${products
-            .map((p, i) => `${i + 1}. ${p.title} - Rs ${p.price}${p.discountPercent ? ` (was Rs ${p.compareAtPrice}, ${p.discountPercent}% off)` : ""} - ${p.available ? "In stock" : "Out of stock"}`)
-            .join("\n")}`
-        : `No matching products found. Politely say we don't have that item right now; invite them to ask about something else. Do NOT list unrelated products.`;
+      let results = await categorySearch(intentData.search_query);
+      if (!results) { const catalog = await getCatalog(); results = keywordSearch(catalog, intentData.search_query); }
+      products = results || [];
+      if (products.length) {
+        context = `Found ${products.length} matching products. In ONE short line, say you found some options and ask which they'd like. Do NOT list them (the cards show below).`;
+      } else {
+        showCall = true;
+        context = `No matching products. In one short line say we don't have that right now and they can call us or ask for something else. Do NOT invent products.`;
+      }
     } else if (intentData.intent === "order_status") {
       action = "track_form";
-      contextForReply = `Customer wants to track an order. Warmly ask them to fill the short tracking form below (order number + name/phone/email).`;
+      context = `Customer wants to track an order. In one short line, ask them to fill the tracking form below.`;
     } else if (intentData.intent === "talk_to_agent") {
-      action = "agent";
-      contextForReply = `Customer wants a human agent. Warmly tell them to use the WhatsApp button below to reach our team.`;
+      action = "agent"; showCall = true;
+      context = `Customer wants a human agent or our number. In one short line, tell them they can call or WhatsApp us using the buttons below.`;
     } else if (intentData.intent === "place_order") {
       action = "order_form";
-      contextForReply = `Customer wants to place an order. Warmly tell them to fill the quick form below and we'll confirm on WhatsApp.`;
+      context = `Customer wants to place an order. In one short line, ask them to fill the quick form below.`;
     } else if (intentData.intent === "greeting") {
-      contextForReply = `Greet warmly in one line and ask how you can help find something for their little one.`;
+      context = `Greet warmly in ONE short line and ask how you can help.`;
     } else {
-      contextForReply = `The message is unclear or not about a specific product. Do NOT show products. Gently ask a clarifying question about what they're looking for.`;
+      context = `Unclear or not a product. Do NOT show products. In one short line, gently ask what they're looking for.`;
     }
 
-    const SYSTEM = `You are Mimi Bot, a warm, friendly assistant for Little Minors, a baby & kids store in Pakistan.
-- Reply in the SAME language the customer used (English->English, Urdu->Urdu, Roman Urdu->Roman Urdu).
-- Keep it to one or two short lines. Warm and helpful. No long paragraphs.
-- Only mention products given in the context. Never invent products, prices, or order info.`;
-
-    const reply = await groqCall(
-      [
-        { role: "system", content: SYSTEM },
-        { role: "system", content: `Context for your reply:\n${contextForReply}` },
-        ...messages.map((m) => ({ role: m.role, content: m.content })),
-      ],
-      { temperature: 0.5, max_tokens: 250 }
-    );
+    const reply = await shortReply(messages, context);
 
     return res.status(200).json({
-      reply: reply || "Sorry, I couldn't respond just now.",
+      reply: reply || "How can I help?",
       intent: intentData.intent,
       products,
       action,
+      showCall,
+      callNumber: showCall ? callNumber : "",
       whatsappNumber: waNumber,
     });
   } catch (e) {
@@ -298,4 +335,19 @@ export default async function handler(req, res) {
     }
     return res.status(500).json({ error: "Server error", detail: msg });
   }
+}
+
+async function shortReply(messages, context) {
+  const SYSTEM = `You are Mimi Bot, a warm assistant for Little Minors, a baby & kids store in Pakistan.
+- Reply in the SAME language the customer used (English/Urdu/Roman Urdu).
+- ALWAYS answer in ONE short line. Never write long paragraphs or lists.
+- Never invent products, prices, or order info.`;
+  return groqCall(
+    [
+      { role: "system", content: SYSTEM },
+      { role: "system", content: `Context: ${context}` },
+      ...messages.map((m) => ({ role: m.role, content: m.content })),
+    ],
+    { temperature: 0.5, max_tokens: 90 }
+  );
 }
