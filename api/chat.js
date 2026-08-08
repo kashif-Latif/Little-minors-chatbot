@@ -119,7 +119,8 @@ function keywords(text) { return tokens(text).filter((w) => !STOP.has(w)); }
 
 // Try to match the query to a collection; return its products if found
 async function categorySearch(query) {
-  const qToks = tokens(query);
+  const IGNORE = new Set(["product", "products", "show", "want", "give", "please", "new", "all", "featured", "pack", "packs"]);
+  const qToks = tokens(query).filter((t) => !IGNORE.has(t));
   if (!qToks.length) return null;
   const cols = await getCollections();
   let best = null, bestScore = 0;
@@ -127,7 +128,6 @@ async function categorySearch(query) {
     const cToks = tokens(c.title);
     let score = 0;
     for (const t of qToks) if (cToks.includes(t)) score += 2;
-    // also substring (e.g. "azadi" in "azadi sale")
     for (const t of qToks) if (c.title.includes(t) && !cToks.includes(t)) score += 1;
     if (score > bestScore) { bestScore = score; best = c; }
   }
@@ -140,14 +140,14 @@ async function categorySearch(query) {
 
 function keywordSearch(catalog, query) {
   const q = (query || "").toLowerCase().trim();
-  const packPhrase = (q.match(/pack of\s*\d+/) || [])[0];        // e.g. "pack of 3"
+  const packPhrase = (q.match(/pack of\s*\d+/) || [])[0];
   const kws = keywords(query);
   if (!kws.length && !packPhrase) return [];
   const scored = catalog.map((p) => {
     const title = p.title.toLowerCase().replace(/\s+/g, " ");
     let score = 0;
-    if (packPhrase && title.includes(packPhrase)) score += 6;   // strongest: exact pack size
-    if (q && title.includes(q)) score += 4;                      // full phrase match
+    if (packPhrase && title.includes(packPhrase)) score += 6;
+    if (q && title.includes(q)) score += 4;
     for (const kw of kws) {
       if (title.includes(kw)) score += 3;
       else if (p._text.includes(kw)) score += 1;
@@ -156,6 +156,12 @@ function keywordSearch(catalog, query) {
   }).filter((x) => x.score > 0)
     .sort((a, b) => (b.score - a.score) || ((b.p.available === true) - (a.p.available === true)));
   return scored.slice(0, 20).map((x) => x.p);
+}
+
+// Strict: only products whose TITLE contains the exact pack size (e.g. "pack of 5")
+function packSearch(catalog, phrase) {
+  const norm = phrase.toLowerCase().replace(/\s+/g, " ");
+  return catalog.filter((p) => p.title.toLowerCase().replace(/\s+/g, " ").includes(norm)).slice(0, 20);
 }
 
 // ---- Order lookup (order number w/ #LM prefix + identity verification) ----
@@ -325,10 +331,13 @@ export default async function handler(req, res) {
     let context = "";
 
     if (intentData.intent === "product") {
-      const q = (intentData.search_query || lastMsg || "").toLowerCase();
+      const q = ((intentData.search_query || "") + " " + lastMsg).toLowerCase();
+      const packPhrase = (q.match(/pack of\s*\d+/) || [])[0];   // e.g. "pack of 5"
       let results;
-      if (/\b(discount|discounted|sale|deal|deals|offer|offers|cheap|off)\b/.test(q)) {
-        // Customer wants discounted items — return products that actually have a discount
+      if (packPhrase) {
+        const catalog = await getCatalog();
+        results = packSearch(catalog, packPhrase);              // ONLY real packs of that size
+      } else if (/\b(discount|discounted|sale|deal|deals|offer|offers|cheap|off)\b/.test(q)) {
         const catalog = await getCatalog();
         results = catalog.filter((p) => p.discountPercent > 0)
           .sort((a, b) => b.discountPercent - a.discountPercent).slice(0, 20);
