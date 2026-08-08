@@ -117,6 +117,94 @@ function tokens(text) {
 }
 function keywords(text) { return tokens(text).filter((w) => !STOP.has(w)); }
 
+// Synonyms: customer word -> words that actually appear in the Little Minors catalog
+const SYNONYMS = {
+  romper: ["romper", "bodysuit", "onesie"],
+  jumpsuit: ["romper", "bodysuit", "onesie"],
+  onesie: ["onesie", "bodysuit", "romper"],
+  bodysuit: ["bodysuit", "romper", "onesie"],
+  frock: ["dress"],
+  jeans: ["trouser", "pant"],
+  jean: ["trouser", "pant"],
+  pant: ["trouser", "pant"],
+  pants: ["trouser", "pant"],
+  trousers: ["trouser"],
+  joggers: ["trouser", "tracksuit"],
+  jogger: ["trouser", "tracksuit"],
+  trackpant: ["tracksuit", "trouser"],
+  trackpants: ["tracksuit", "trouser"],
+  hoodie: ["tracksuit", "suit"],
+  nappy: ["diaper"],
+  nappies: ["diaper"],
+  tee: ["shirt", "tee"],
+  tshirt: ["shirt", "tee"],
+  tshirts: ["shirt", "tee"],
+  pyjama: ["pajama", "sleepwear"],
+  pyjamas: ["pajama", "sleepwear"],
+  pajamas: ["pajama", "sleepwear"],
+  nightwear: ["sleepwear", "pajama"],
+  nightsuit: ["sleepwear", "pajama", "suit"],
+  soother: ["pacifier", "soother"],
+  dummy: ["pacifier", "soother"],
+  sipper: ["feeder", "bottle"],
+  feeder: ["feeder", "feeding", "bottle"],
+  drone: ["drone", "aircraft", "plane"],
+  fan: ["fan"],
+};
+
+function expandSynonyms(kws) {
+  const out = new Set(kws);
+  for (const k of kws) if (SYNONYMS[k]) SYNONYMS[k].forEach((s) => out.add(s));
+  return [...out];
+}
+
+// Damerau-OSA distance: single edits AND adjacent letter swaps count as 1
+function editDistance(a, b) {
+  const m = a.length, n = b.length;
+  if (!m) return n; if (!n) return m;
+  const d = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = 0; i <= m; i++) d[i][0] = i;
+  for (let j = 0; j <= n; j++) d[0][j] = j;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost);
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
+        d[i][j] = Math.min(d[i][j], d[i - 2][j - 2] + 1);
+      }
+    }
+  }
+  return d[m][n];
+}
+
+// Live vocabulary built from the fetched catalog (self-updating)
+let VOCAB = null, VOCAB_TIME = 0;
+function getVocab(catalog) {
+  if (VOCAB && Date.now() - VOCAB_TIME < TTL) return VOCAB;
+  const set = new Set();
+  for (const p of catalog) for (const w of p._text.split(/\s+/)) if (w.length > 2) set.add(w);
+  VOCAB = [...set]; VOCAB_TIME = Date.now(); return VOCAB;
+}
+
+// Add close-spelling matches for typos (e.g. "rompar" -> "romper")
+function fuzzyExpand(kws, vocab) {
+  const out = new Set(kws);
+  for (const kw of kws) {
+    if (kw.length < 4) continue;
+    // "direct" only if a catalog word actually contains this keyword (not the reverse)
+    let direct = false;
+    for (const v of vocab) { if (v.includes(kw)) { direct = true; break; } }
+    if (direct) continue;
+    const th = kw.length <= 5 ? 1 : 2;
+    for (const v of vocab) {
+      if (v.length < 4) continue;
+      if (Math.abs(v.length - kw.length) > 2) continue;
+      if (editDistance(kw, v) <= th) out.add(v);
+    }
+  }
+  return [...out];
+}
+
 // Try to match the query to a collection; return its products if found
 async function categorySearch(query) {
   const IGNORE = new Set(["product", "products", "show", "want", "give", "please", "new", "all", "featured", "pack", "packs"]);
@@ -141,7 +229,9 @@ async function categorySearch(query) {
 function keywordSearch(catalog, query) {
   const q = (query || "").toLowerCase().trim();
   const packPhrase = (q.match(/pack of\s*\d+/) || [])[0];
-  const kws = keywords(query);
+  let kws = keywords(query);
+  kws = expandSynonyms(kws);
+  kws = fuzzyExpand(kws, getVocab(catalog));   // typo tolerance + synonyms
   if (!kws.length && !packPhrase) return [];
   const scored = catalog.map((p) => {
     const title = p.title.toLowerCase().replace(/\s+/g, " ");
@@ -311,6 +401,12 @@ export default async function handler(req, res) {
     }
 
     const lastMsg = ([...messages].reverse().find((m) => m.role === "user") || {}).content || "";
+
+    // Open/check + exchange policy shortcut
+    if (/\b(open|khol|kholna|khool|check the product|exchange|return|refund|replace|replacement|policy|7 ?days?|wapas|badal)\b/i.test(lastMsg)) {
+      const reply = await shortReply(messages, "Customer asks about opening/checking the product or the exchange policy. Tell them warmly in one or two lines: yes, they can open and check the product on delivery, and exchange it within 7 days if there's any issue.");
+      return res.status(200).json({ reply, products: [], action: "none", whatsappNumber: waNumber });
+    }
 
     // Quick carrier shortcut
     if (/\b(postex|ownexpress|own express|courier|carrier)\b/i.test(lastMsg)) {
