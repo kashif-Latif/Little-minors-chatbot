@@ -4,8 +4,12 @@
 // Env vars: GROQ_API_KEY, SHOPIFY_STORE, SHOPIFY_ADMIN_TOKEN,
 //           WHATSAPP_NUMBER (e.g. 923018481401), PUBLIC_DOMAIN, ALLOWED_ORIGIN
 
-const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-const GROQ_MODEL = "llama-3.3-70b-versatile";
+// AI provider: OpenRouter (OpenAI-compatible). Auto-fallback across free models.
+// Set OPENROUTER_MODELS in Vercel (comma-separated) to pin/override models.
+// Default uses OpenRouter's auto-router which picks a working free model automatically.
+const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
+const MODELS = (process.env.OPENROUTER_MODELS || "openrouter/free")
+  .split(",").map((s) => s.trim()).filter(Boolean);
 
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Origin", process.env.ALLOWED_ORIGIN || "*");
@@ -283,30 +287,24 @@ function packSearch(catalog, phrase) {
   return catalog.filter((p) => p.title.toLowerCase().replace(/\s+/g, " ").includes(norm)).slice(0, 20);
 }
 
-// AI-powered matching: the model reads the full catalog and picks products for ANY query.
-// Understands synonyms, misspellings, phonetics, product types — no fixed keyword rules.
-async function aiPickProducts(catalog, query) {
-  if (!query || !catalog.length) return null;
-  const list = catalog.slice(0, 250).map((p, i) => `${i}: ${p.title}`).join("\n");
+// AI refine: model picks/ranks from a SMALL shortlist (token-light).
+// candidates is already a narrowed list from keyword search.
+const AIPICK_CACHE = new Map(); // query -> {t, titles:Set}
+async function aiPickProducts(candidates, query) {
+  if (!query || !candidates.length) return null;
+  const list = candidates.slice(0, 25).map((p, i) => `${i}: ${p.title}`).join("\n");
   const prompt = `A customer of a baby & kids store said: "${query}"
 
-From the product list below, return ONLY a JSON array of the index numbers of products that genuinely match what the customer wants. Rules:
-- Understand synonyms, misspellings, phonetic errors, product types, ages, colours, and pack sizes.
-- If the customer names a product type (e.g. pants/trousers, shirt, romper, fan), include ONLY that type — do not include unrelated types.
-- Order by best match first. Max 15 indexes.
-- If nothing genuinely matches, return [].
-No text, no markdown, just the JSON array.
-
+From this short product list, return ONLY a JSON array of the index numbers that genuinely match what the customer wants (understand synonyms, misspellings, phonetics, product type, age, colour, pack size). If they named a product type, include ONLY that type. Best match first, max 12. If none match, return [].
 Products:
 ${list}`;
   try {
-    const raw = await groqCall([{ role: "user", content: prompt }], { temperature: 0, max_tokens: 150 });
-    const clean = raw.replace(/```json/gi, "").replace(/```/g, "").trim();
-    const match = clean.match(/\[[\s\S]*\]/);
-    const arr = JSON.parse(match ? match[0] : clean);
+    const raw = await groqCall([{ role: "user", content: prompt }], { temperature: 0, max_tokens: 80 });
+    const m = raw.replace(/```json/gi, "").replace(/```/g, "").trim().match(/\[[\s\S]*\]/);
+    const arr = JSON.parse(m ? m[0] : "[]");
     if (!Array.isArray(arr)) return null;
-    const picked = arr.map((i) => catalog[Number(i)]).filter(Boolean);
-    return picked;
+    const picked = arr.map((i) => candidates[Number(i)]).filter(Boolean);
+    return picked.length ? picked : null;
   } catch (e) { return null; }
 }
 
@@ -385,14 +383,32 @@ async function lookupOrder({ orderId, phone, email }) {
 
 async function groqCall(messages, opts) {
   const { temperature = 0.5, max_tokens = 200 } = opts || {};
-  const r = await fetch(GROQ_URL, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model: GROQ_MODEL, messages, temperature, max_tokens }),
-  });
-  if (!r.ok) throw new Error(await r.text());
-  const data = await r.json();
-  return data?.choices?.[0]?.message?.content || "";
+  let lastErr = "";
+  for (const model of MODELS) {
+    try {
+      const r = await fetch(OPENROUTER_URL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+          "Content-Type": "application/json",
+          "HTTP-Referer": process.env.PUBLIC_DOMAIN || "https://littleminors.com",
+          "X-Title": "Little Minors Bee Bot",
+        },
+        body: JSON.stringify({ model, messages, temperature, max_tokens }),
+      });
+      if (r.status === 429) { lastErr = "429 rate limit"; continue; }   // busy -> try next model
+      if (r.status === 401) { throw new Error("401 invalid api key"); } // key problem -> stop
+      if (!r.ok) { lastErr = await r.text(); continue; }
+      const data = await r.json();
+      const txt = data?.choices?.[0]?.message?.content;
+      if (txt) return txt;
+      lastErr = "empty response";
+    } catch (e) {
+      if (String(e).includes("401")) throw e;
+      lastErr = String(e);
+    }
+  }
+  throw new Error(lastErr || "all models failed");
 }
 
 async function detectIntent(messages) {
@@ -473,19 +489,19 @@ export default async function handler(req, res) {
     // Open/check + exchange policy shortcut
     if (/\b(open|khol|kholna|khool|check the product|exchange|return|returns|refund|replace|replacement|policy|7 ?days?|wapas|badal)\b/i.test(lastMsg)) {
       const reply = await shortReply(messages, "Customer asks about opening/checking the product, returns, refunds, or exchange. State clearly and warmly in one or two lines: they can open and check the product on delivery, and we offer a 7-day EXCHANGE only. We do NOT offer returns or refunds — exchange within 7 days only if there's an issue. Do not say we have a return policy.");
-      return res.status(200).json({ reply, products: [], action: "none", whatsappNumber: waNumber });
+      return res.status(200).json({ reply: reply || "You can open & check the product on delivery. We offer 7-day exchange only — no returns or refunds.", products: [], action: "none", whatsappNumber: waNumber });
     }
 
     // Quick carrier shortcut
     if (/\b(postex|ownexpress|own express|courier|carrier)\b/i.test(lastMsg)) {
       const reply = await shortReply(messages, "Customer asks about the courier/carrier. Tell them we ship via PostEx and OwnExpress, and they can track using the buttons below.");
-      return res.status(200).json({ reply, products: [], action: "none", showCarriers: true, whatsappNumber: waNumber });
+      return res.status(200).json({ reply: reply || "We ship via PostEx and OwnExpress — track using the buttons below.", products: [], action: "none", showCarriers: true, whatsappNumber: waNumber });
     }
 
     // Quick order-tracking shortcut (typed phrases like "where is my order")
     if (/\b(track|tracking|my order|where.*order|order status|parcel|shipment|kahan|kahaan)\b/i.test(lastMsg)) {
       const reply = await shortReply(messages, "Customer wants to track an order. In one short line, ask them to fill the tracking form below.");
-      return res.status(200).json({ reply, products: [], action: "track_form", whatsappNumber: waNumber });
+      return res.status(200).json({ reply: reply || "Please share your order number or tracking ID below.", products: [], action: "track_form", whatsappNumber: waNumber });
     }
 
     const intentData = await detectIntent(messages);
@@ -506,13 +522,20 @@ export default async function handler(req, res) {
         results = catalog.filter((p) => p.discountPercent > 0)
           .sort((a, b) => b.discountPercent - a.discountPercent).slice(0, 20);
       } else {
-        // General query: try collections first, then AI matching, then keyword fallback
+        // 1) collections (fast, no tokens) for category names like "Azadi Sale"
         results = await categorySearch(intentData.search_query);
         if (!results) {
           const catalog = await getCatalog();
           const query = intentData.search_query || lastMsg;
-          results = await aiPickProducts(catalog, query);          // AI reads catalog, picks matches
-          if (!results || !results.length) results = keywordSearch(catalog, query); // fallback
+          const base = keywordSearch(catalog, query);       // fast, synonyms+fuzzy+type filter, 0 tokens
+          if (base.length > 4) {
+            const refined = await aiPickProducts(base, query); // AI refine over a SMALL shortlist
+            results = refined && refined.length ? refined : base;
+          } else if (base.length >= 1) {
+            results = base;                                    // already narrow — no AI needed
+          } else {
+            results = [];                                       // rare keyword miss -> no products (bot offers agent)
+          }
         }
       }
       products = results || [];
@@ -540,9 +563,12 @@ export default async function handler(req, res) {
     }
 
     const reply = await shortReply(messages, context);
+    const fallback = products.length
+      ? "Here are some options for you 👇"
+      : (showCall ? "I couldn't find that. You can call our team using the button below." : "How can I help you find something for your little one?");
 
     return res.status(200).json({
-      reply: reply || "How can I help?",
+      reply: reply || fallback,
       intent: intentData.intent,
       products,
       action,
@@ -564,12 +590,14 @@ async function shortReply(messages, context) {
 - Reply in the SAME language the customer used (English/Urdu/Roman Urdu).
 - ALWAYS answer in ONE short line. Never write long paragraphs or lists.
 - Never invent products, prices, or order info.`;
-  return groqCall(
-    [
-      { role: "system", content: SYSTEM },
-      { role: "system", content: `Context: ${context}` },
-      ...messages.map((m) => ({ role: m.role, content: m.content })),
-    ],
-    { temperature: 0.5, max_tokens: 90 }
-  );
+  try {
+    return await groqCall(
+      [
+        { role: "system", content: SYSTEM },
+        { role: "system", content: `Context: ${context}` },
+        ...messages.slice(-6).map((m) => ({ role: m.role, content: m.content })),
+      ],
+      { temperature: 0.5, max_tokens: 90 }
+    );
+  } catch (e) { return ""; }
 }
