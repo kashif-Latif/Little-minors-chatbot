@@ -19,18 +19,25 @@ function shopHeaders() {
 function storeBase() { return `https://${process.env.SHOPIFY_STORE}`; }
 
 function mapProduct(p) {
-  const variant = (p.variants && p.variants[0]) || {};
+  const variants = p.variants || [];
+  const variant = variants[0] || {};
   const image = (p.image && p.image.src) || (p.images && p.images[0] && p.images[0].src) || "";
   const price = parseFloat(variant.price || "0");
   const compareAt = parseFloat(variant.compare_at_price || "0");
   const hasDiscount = compareAt > price && price > 0;
+  // Available if ANY variant is in stock, or inventory isn't tracked, or oversell allowed
+  const available = variants.some((v) => {
+    if (v.inventory_management == null) return true;          // Shopify not tracking -> treat as available
+    if (v.inventory_policy === "continue") return true;       // allowed to oversell
+    return (v.inventory_quantity || 0) > 0;
+  });
   return {
     title: p.title || "",
     handle: p.handle || "",
     price: variant.price || "",
     compareAtPrice: hasDiscount ? variant.compare_at_price : "",
     discountPercent: hasDiscount ? Math.round((1 - price / compareAt) * 100) : 0,
-    available: (variant.inventory_quantity || 0) > 0,
+    available,
     image,
     url: `${storeBase()}/products/${p.handle}`,
     _text: `${p.title || ""} ${p.product_type || ""} ${p.tags || ""} ${p.vendor || ""}`.toLowerCase(),
@@ -156,12 +163,13 @@ function normPhone(v) { const d = String(v || "").replace(/\D/g, ""); return d.l
 
 async function findOrderByNumber(orderId) {
   const digits = String(orderId).replace(/[^0-9]/g, "");
-  const candidates = [`LM${digits}`, `#LM${digits}`, digits, String(orderId)];
+  const candidates = [digits, `LM${digits}`, `#LM${digits}`, `#${digits}`, String(orderId)];
   for (const name of candidates) {
+    if (!name) continue;
     try {
       const url = `${storeBase()}/admin/api/2024-10/orders.json?status=any&name=${encodeURIComponent(name)}`;
       const r = await fetch(url, { headers: shopHeaders() });
-      if (r.status === 403) return { error: "no_scope" };
+      if (r.status === 401 || r.status === 403) return { error: "auth" };
       if (!r.ok) continue;
       const data = await r.json();
       if (data.orders && data.orders.length) return { order: data.orders[0] };
@@ -199,7 +207,7 @@ async function lookupOrder({ orderId, phone, email }) {
   let order = null;
   if (orderId) {
     const found = await findOrderByNumber(orderId);
-    if (found.error === "no_scope") return { ok: false, reason: "no_scope" };
+    if (found.error === "auth") return { ok: false, reason: "auth" };
     order = found.order;
   }
   if (!order && (email || phone)) {
@@ -280,12 +288,14 @@ export default async function handler(req, res) {
         });
       }
       const msg = {
+        auth: "Order tracking isn't authorized yet. Please message us on WhatsApp and we'll check for you.",
         no_scope: "Order tracking isn't switched on yet. Please message us on WhatsApp and we'll check for you.",
         no_customer_scope: "Searching by phone/email isn't enabled. Please enter your order number instead.",
         need_any: "Please enter your order number, phone, or email.",
         not_found: "I couldn't find an order with those details. Please double-check and try again.",
         error: "I couldn't check the order right now. Please try again shortly.",
       }[r.reason] || "I couldn't check the order right now.";
+      return res.status(200).json({ reply: msg, order: null, reason: r.reason, showCarriers: false, whatsappNumber: waNumber, callNumber });
       return res.status(200).json({ reply: msg, order: null, showCarriers: true, whatsappNumber: waNumber, callNumber });
     }
 
@@ -300,6 +310,12 @@ export default async function handler(req, res) {
     if (/\b(postex|ownexpress|own express|courier|carrier)\b/i.test(lastMsg)) {
       const reply = await shortReply(messages, "Customer asks about the courier/carrier. Tell them we ship via PostEx and OwnExpress, and they can track using the buttons below.");
       return res.status(200).json({ reply, products: [], action: "none", showCarriers: true, whatsappNumber: waNumber });
+    }
+
+    // Quick order-tracking shortcut (typed phrases like "where is my order")
+    if (/\b(track|tracking|my order|where.*order|order status|parcel|shipment|kahan|kahaan)\b/i.test(lastMsg)) {
+      const reply = await shortReply(messages, "Customer wants to track an order. In one short line, ask them to fill the tracking form below.");
+      return res.status(200).json({ reply, products: [], action: "track_form", whatsappNumber: waNumber });
     }
 
     const intentData = await detectIntent(messages);
@@ -321,6 +337,8 @@ export default async function handler(req, res) {
         if (!results) { const catalog = await getCatalog(); results = keywordSearch(catalog, intentData.search_query); }
       }
       products = results || [];
+      // Only show IN-STOCK products
+      products = products.filter((p) => p.available);
       if (products.length) {
         context = `Found ${products.length} matching products. In ONE short line, say you found some options and ask which they'd like. Do NOT list them (the cards show below).`;
       } else {
