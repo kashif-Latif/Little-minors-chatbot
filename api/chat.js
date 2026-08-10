@@ -263,6 +263,42 @@ async function categorySearch(query) {
   return null;
 }
 
+// Clean a query into catalog-friendly words (synonyms + typo fixes) before searching Shopify
+function cleanQuery(query, catalog) {
+  let kws = keywords(query);
+  kws = expandSynonyms(kws);
+  kws = fuzzyExpand(kws, getVocab(catalog));
+  // keep original words too, de-duplicated
+  const all = new Set([...(query || "").toLowerCase().split(/\s+/).filter((w) => w.length > 2), ...kws]);
+  return [...all].join(" ").trim();
+}
+
+// Shopify storefront search (suggest.json) — the store's own search engine, no key needed.
+// Returns product handles, which we match back to the live Admin catalog for accurate price/stock/image.
+async function shopifySuggest(query, catalog) {
+  const domain = (process.env.PUBLIC_DOMAIN || "https://littleminors.com").replace(/\/+$/, "");
+  const cleaned = cleanQuery(query, catalog) || query;
+  const url = `${domain}/search/suggest.json?q=${encodeURIComponent(cleaned)}&resources[type]=product&resources[limit]=10`;
+  try {
+    const r = await fetch(url, { headers: { "Accept": "application/json" } });
+    if (!r.ok) return null;
+    const data = await r.json();
+    const items = data?.resources?.results?.products || [];
+    if (!items.length) return null;
+    // Match each suggest result to our live Admin catalog by handle (for real stock/discount/image)
+    const byHandle = new Map(catalog.map((p) => [p.handle, p]));
+    const results = [];
+    for (const it of items) {
+      const handle = (it.handle || (it.url || "").split("/products/")[1] || "").split("?")[0];
+      const live = byHandle.get(handle);
+      if (live) results.push(live);            // prefer our live Admin data
+    }
+    return results.length ? results : null;
+  } catch (e) {
+    return null;
+  }
+}
+
 function keywordSearch(catalog, query) {
   const q = (query || "").toLowerCase().trim();
   const packPhrase = (q.match(/pack of\s*\d+/) || [])[0];
@@ -548,19 +584,22 @@ export default async function handler(req, res) {
         results = catalog.filter((p) => p.discountPercent > 0)
           .sort((a, b) => b.discountPercent - a.discountPercent).slice(0, 20);
       } else {
-        // 1) collections (fast, no tokens) for category names like "Azadi Sale"
+        // 1) collections (fast) for category names like "Azadi Sale"
         results = await categorySearch(intentData.search_query);
         if (!results) {
           const catalog = await getCatalog();
           const query = intentData.search_query || lastMsg;
-          const base = keywordSearch(catalog, query);       // fast, synonyms+fuzzy+type filter, 0 tokens
-          if (base.length > 4) {
-            const refined = await aiPickProducts(base, query); // AI refine over a SMALL shortlist
-            results = refined && refined.length ? refined : base;
-          } else if (base.length >= 1) {
-            results = base;                                    // already narrow — no AI needed
-          } else {
-            results = [];                                       // rare keyword miss -> no products (bot offers agent)
+          // 2) Shopify's own search engine first (sharp, free, no AI tokens)
+          results = await shopifySuggest(query, catalog);
+          // 3) fall back to our keyword+AI search if suggest returns nothing
+          if (!results || !results.length) {
+            const base = keywordSearch(catalog, query);
+            if (base.length > 4) {
+              const refined = await aiPickProducts(base, query);
+              results = refined && refined.length ? refined : base;
+            } else {
+              results = base;
+            }
           }
         }
       }
