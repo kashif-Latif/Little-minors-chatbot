@@ -660,15 +660,15 @@ export default async function handler(req, res) {
       if (products.length) {
         context = `Found ${products.length} matching products. In ONE short line, say you found some options and ask which they'd like. Do NOT list them (the cards show below).`;
       } else {
-        showCall = true;
-        context = `No matching products. In one short line say we don't have that right now and they can call us or ask for something else. Do NOT invent products.`;
+        action = "agent";
+        context = `No matching products. In one short line say we don't have that right now, and they can chat with our team on WhatsApp (button below) or ask for something else. Do NOT invent products.`;
       }
     } else if (intentData.intent === "order_status") {
       action = "track_form";
       context = `Customer wants to track an order. In one short line, ask them to fill the tracking form below.`;
     } else if (intentData.intent === "talk_to_agent") {
-      action = "agent"; showCall = true;
-      context = `Customer wants a human agent or our number. In one short line, tell them they can call or WhatsApp us using the buttons below.`;
+      action = "agent";
+      context = `Customer wants a human agent. In one or two short lines, warmly tell them they can chat with our team on WhatsApp using the button below. Mention our hours are Monday to Saturday, 10am to 6pm, and we usually reply within 1 to 2 hours. Reply in the customer's language.`;
     } else if (intentData.intent === "place_order") {
       action = "order_form";
       context = `Customer wants to place an order. In one short line, ask them to fill the quick form below.`;
@@ -681,7 +681,7 @@ export default async function handler(req, res) {
     const reply = await shortReply(messages, context);
     const fallback = products.length
       ? "Here are some options for you 👇"
-      : (showCall ? "I couldn't find that. You can call our team using the button below." : "How can I help you find something for your little one?");
+      : (action === "agent" ? "You can chat with our team on WhatsApp using the button below." : "How can I help you find something for your little one?");
 
     return res.status(200).json({
       reply: reply || fallback,
