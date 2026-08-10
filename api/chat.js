@@ -268,14 +268,10 @@ async function categorySearch(query) {
 // Broad (e.g. "lipstick", "boys pants") -> more, for browsing.
 function trimBySpecificity(query, results) {
   if (!results || !results.length) return results || [];
-  const qWords = keywords(query);
-  const topTitle = (results[0].title || "").toLowerCase();
-  const overlap = qWords.length ? qWords.filter((w) => topTitle.includes(w)).length / qWords.length : 0;
-  const specificHigh = qWords.length >= 6 || (qWords.length >= 3 && overlap >= 0.85);
-  const specificMid = qWords.length >= 4 || (qWords.length >= 2 && overlap >= 0.7);
-  if (specificHigh) return results.slice(0, 1);   // exact product -> just the one
-  if (specificMid) return results.slice(0, 4);    // fairly specific -> a few
-  return results.slice(0, 10);                    // broad -> more for browsing
+  const n = keywords(query).length;   // number of meaningful words the customer typed
+  if (n >= 6) return results.slice(0, 1);    // full product-name paste -> the one accurate product
+  if (n === 5) return results.slice(0, 4);   // fairly specific -> a few
+  return results.slice(0, 10);               // short/browse query ("lipstick", "boys pants") -> more
 }
 
 // Shopify storefront search (suggest.json) — the store's own search engine, no key needed.
@@ -350,6 +346,29 @@ function keywordSearch(catalog, query) {
 
   scored.sort((a, b) => (b.score - a.score) || ((b.p.available === true) - (a.p.available === true)));
   return scored.slice(0, 20).map((x) => x.p);
+}
+
+// Returns the pack phrase (e.g. "pack of 3") ONLY if the message is a generic pack browse
+// ("pack of 3", "show me pack of 5", "all packs"). Returns null if a specific product is named
+// (e.g. "Pack of 3 Mini USB Fans ..."), so that goes to normal product search instead.
+function packOnly(msg) {
+  const text = (msg || "").toLowerCase();
+  const m = text.match(/pack of\s*(\d+)/);
+  const plain = /^\s*(all\s+)?packs?\s*$/.test(text);
+  if (!m && !plain) return null;
+  const FILLER = new Set([
+    "pack", "packs", "all", "show", "want", "dikhao", "dikhaen", "please", "the", "for", "me", "mujhy",
+    "ye", "yeh", "wala", "wali", "chahie", "chahiye", "chaiye", "chaheye", "mujhe", "iski", "iska",
+    "price", "qeemat", "keemat", "hai", "kia", "kya", "kaun", "konsa", "konsi", "ka", "ke",
+    "apke", "apkay", "pass", "paas", "hain", "any", "some", "and",
+  ]);
+  const rest = text
+    .replace(/pack of\s*\d+/g, " ")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w.length > 1 && !FILLER.has(w) && !/^\d+$/.test(w));
+  if (rest.length === 0) return m ? `pack of ${m[1]}` : "pack";  // generic pack query
+  return null;                                                    // specific product -> not a pack browse
 }
 
 // Strict: only products whose TITLE contains the exact pack size (e.g. "pack of 5")
@@ -552,17 +571,17 @@ export default async function handler(req, res) {
 
     const lastMsg = ([...messages].reverse().find((m) => m.role === "user") || {}).content || "";
 
-    // Deterministic PACK shortcut: "pack of N" (or "packs"/"pack") always shows packs directly,
-    // bypassing intent ambiguity so it never asks "which pack?" and always shows products.
-    const packM = lastMsg.match(/pack of\s*\d+/i);
-    if (packM || /^\s*(all\s+)?packs?\s*$/i.test(lastMsg)) {
+    // Deterministic PACK shortcut: only for GENERIC pack browse ("pack of 3", "all packs").
+    // If a specific product is named ("Pack of 3 Mini USB Fans..."), skip this and search normally.
+    const genericPack = packOnly(lastMsg);
+    if (genericPack) {
       const catalog = await getCatalog();
       let products;
-      if (packM) products = packSearch(catalog, packM[0].toLowerCase());
+      if (genericPack.startsWith("pack of")) products = packSearch(catalog, genericPack);
       else products = catalog.filter((p) => p.title.toLowerCase().includes("pack")).slice(0, 20);
       products = products.filter((p) => p.available);
       const reply = products.length
-        ? (packM ? `Here are our ${packM[0].toLowerCase()} options 👇` : "Here are our packs 👇")
+        ? (genericPack.startsWith("pack of") ? `Here are our ${genericPack} options 👇` : "Here are our packs 👇")
         : "We don't have that pack in stock right now. Would you like to see something else?";
       return res.status(200).json({ reply, products, whatsappNumber: waNumber });
     }
@@ -593,9 +612,9 @@ export default async function handler(req, res) {
 
     if (intentData.intent === "product") {
       const q = ((intentData.search_query || "") + " " + lastMsg).toLowerCase();
-      const packPhrase = (q.match(/pack of\s*\d+/) || [])[0];   // e.g. "pack of 5"
+      const packPhrase = packOnly(lastMsg);   // only for generic pack browse; null if specific product
       let results;
-      if (packPhrase) {
+      if (packPhrase && packPhrase.startsWith("pack of")) {
         const catalog = await getCatalog();
         results = packSearch(catalog, packPhrase);              // ONLY real packs of that size
       } else if (/\b(discount|discounted|sale|deal|deals|offer|offers|cheap|off)\b/.test(q)) {
