@@ -263,35 +263,39 @@ async function categorySearch(query) {
   return null;
 }
 
-// Clean a query into catalog-friendly words (synonyms + typo fixes) before searching Shopify
-function cleanQuery(query, catalog) {
-  let kws = keywords(query);
-  kws = expandSynonyms(kws);
-  kws = fuzzyExpand(kws, getVocab(catalog));
-  // keep original words too, de-duplicated
-  const all = new Set([...(query || "").toLowerCase().split(/\s+/).filter((w) => w.length > 2), ...kws]);
-  return [...all].join(" ").trim();
-}
-
 // Shopify storefront search (suggest.json) — the store's own search engine, no key needed.
-// Returns product handles, which we match back to the live Admin catalog for accurate price/stock/image.
+// Send a CLEAN query (Shopify ranks relevance itself). Match results back to live Admin data.
 async function shopifySuggest(query, catalog) {
   const domain = (process.env.PUBLIC_DOMAIN || "https://littleminors.com").replace(/\/+$/, "");
-  const cleaned = cleanQuery(query, catalog) || query;
-  const url = `${domain}/search/suggest.json?q=${encodeURIComponent(cleaned)}&resources[type]=product&resources[limit]=10`;
+  const q = (query || "").trim();
+  if (!q) return null;
+  const url = `${domain}/search/suggest.json?q=${encodeURIComponent(q)}&resources[type]=product&resources[limit]=10`;
   try {
     const r = await fetch(url, { headers: { "Accept": "application/json" } });
     if (!r.ok) return null;
     const data = await r.json();
     const items = data?.resources?.results?.products || [];
     if (!items.length) return null;
-    // Match each suggest result to our live Admin catalog by handle (for real stock/discount/image)
     const byHandle = new Map(catalog.map((p) => [p.handle, p]));
     const results = [];
-    for (const it of items) {
+    for (const it of items) {                       // keep Shopify's relevance order (best match first)
       const handle = (it.handle || (it.url || "").split("/products/")[1] || "").split("?")[0];
       const live = byHandle.get(handle);
-      if (live) results.push(live);            // prefer our live Admin data
+      if (live) {
+        results.push(live);                         // prefer our live Admin data (accurate stock/discount/image)
+      } else if (it.title) {
+        // not in Admin catalog (rare) — show it from suggest data so the accurate product still appears
+        results.push({
+          title: it.title,
+          handle,
+          price: (it.price != null ? String(it.price).replace(/[^0-9.]/g, "") : ""),
+          compareAtPrice: "",
+          discountPercent: 0,
+          available: it.available !== false,
+          image: it.image || it.featured_image || "",
+          url: `${domain}/products/${handle}`,
+        });
+      }
     }
     return results.length ? results : null;
   } catch (e) {
