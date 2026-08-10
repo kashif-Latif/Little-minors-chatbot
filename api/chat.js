@@ -263,6 +263,21 @@ async function categorySearch(query) {
   return null;
 }
 
+// Decide how many results to show based on how SPECIFIC the query is.
+// Specific (a product name / long query / near-exact top match) -> few accurate.
+// Broad (e.g. "lipstick", "boys pants") -> more, for browsing.
+function trimBySpecificity(query, results) {
+  if (!results || !results.length) return results || [];
+  const qWords = keywords(query);
+  const topTitle = (results[0].title || "").toLowerCase();
+  const overlap = qWords.length ? qWords.filter((w) => topTitle.includes(w)).length / qWords.length : 0;
+  const specificHigh = qWords.length >= 6 || (qWords.length >= 3 && overlap >= 0.85);
+  const specificMid = qWords.length >= 4 || (qWords.length >= 2 && overlap >= 0.7);
+  if (specificHigh) return results.slice(0, 1);   // exact product -> just the one
+  if (specificMid) return results.slice(0, 4);    // fairly specific -> a few
+  return results.slice(0, 10);                    // broad -> more for browsing
+}
+
 // Shopify storefront search (suggest.json) — the store's own search engine, no key needed.
 // Send a CLEAN query (Shopify ranks relevance itself). Match results back to live Admin data.
 async function shopifySuggest(query, catalog) {
@@ -592,14 +607,18 @@ export default async function handler(req, res) {
         results = await categorySearch(intentData.search_query);
         if (!results) {
           const catalog = await getCatalog();
-          const query = intentData.search_query || lastMsg;
-          // 2) Shopify's own search engine first (sharp, free, no AI tokens)
-          results = await shopifySuggest(query, catalog);
-          // 3) fall back to our keyword+AI search if suggest returns nothing
+          const rawQ = lastMsg;                                 // exactly what the customer typed
+          const normQ = intentData.search_query || lastMsg;     // AI-cleaned (fixes typos/synonyms)
+          // 2) Shopify's own search engine — RAW first (accurate for specific names), then cleaned
+          results = await shopifySuggest(rawQ, catalog);
+          if (!results || !results.length) results = await shopifySuggest(normQ, catalog);
+          // narrow to the accurate product when the query strongly matches one
+          if (results && results.length) results = trimBySpecificity(rawQ, results);
+          // 3) fall back to our keyword+AI search if Shopify returns nothing
           if (!results || !results.length) {
-            const base = keywordSearch(catalog, query);
+            const base = keywordSearch(catalog, normQ);
             if (base.length > 4) {
-              const refined = await aiPickProducts(base, query);
+              const refined = await aiPickProducts(base, normQ);
               results = refined && refined.length ? refined : base;
             } else {
               results = base;
