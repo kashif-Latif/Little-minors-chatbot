@@ -276,17 +276,25 @@ function trimBySpecificity(query, results) {
 
 // Shopify storefront search (suggest.json) — the store's own search engine, no key needed.
 // Send a CLEAN query (Shopify ranks relevance itself). Match results back to live Admin data.
+const SUGGEST_CACHE = new Map();   // query -> {t, results}
 async function shopifySuggest(query, catalog) {
   const domain = (process.env.PUBLIC_DOMAIN || "https://littleminors.com").replace(/\/+$/, "");
   const q = (query || "").trim();
   if (!q) return null;
+
+  const cached = SUGGEST_CACHE.get(q.toLowerCase());
+  if (cached && Date.now() - cached.t < 60000) return cached.results;   // 60s cache
+
   const url = `${domain}/search/suggest.json?q=${encodeURIComponent(q)}&resources[type]=product&resources[limit]=10`;
   try {
-    const r = await fetch(url, { headers: { "Accept": "application/json" } });
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 2500);   // don't let a slow call hang the reply
+    const r = await fetch(url, { headers: { "Accept": "application/json" }, signal: ctrl.signal });
+    clearTimeout(timer);
     if (!r.ok) return null;
     const data = await r.json();
     const items = data?.resources?.results?.products || [];
-    if (!items.length) return null;
+    if (!items.length) { SUGGEST_CACHE.set(q.toLowerCase(), { t: Date.now(), results: null }); return null; }
     const byHandle = new Map(catalog.map((p) => [p.handle, p]));
     const results = [];
     for (const it of items) {                       // keep Shopify's relevance order (best match first)
@@ -295,7 +303,6 @@ async function shopifySuggest(query, catalog) {
       if (live) {
         results.push(live);                         // prefer our live Admin data (accurate stock/discount/image)
       } else if (it.title) {
-        // not in Admin catalog (rare) — show it from suggest data so the accurate product still appears
         results.push({
           title: it.title,
           handle,
@@ -308,9 +315,11 @@ async function shopifySuggest(query, catalog) {
         });
       }
     }
-    return results.length ? results : null;
+    const out = results.length ? results : null;
+    SUGGEST_CACHE.set(q.toLowerCase(), { t: Date.now(), results: out });
+    return out;
   } catch (e) {
-    return null;
+    return null;   // timeout or network error -> fall back to our own search
   }
 }
 
