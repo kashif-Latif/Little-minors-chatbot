@@ -427,6 +427,25 @@ async function findOrderByNumber(orderId) {
   return { order: null };
 }
 
+async function findOrderByTracking(trackingNumber) {
+  const t = String(trackingNumber || "").replace(/\s/g, "").toLowerCase();
+  if (!t) return { order: null };
+  try {
+    const url = `${storeBase()}/admin/api/2024-10/orders.json?status=any&limit=250&fields=id,name,financial_status,fulfillment_status,total_price,currency,line_items,fulfillments`;
+    const r = await fetch(url, { headers: shopHeaders() });
+    if (r.status === 401 || r.status === 403) return { error: "auth" };
+    if (!r.ok) return { order: null };
+    const data = await r.json();
+    for (const order of (data.orders || [])) {
+      for (const f of (order.fulfillments || [])) {
+        const nums = [f.tracking_number, ...(f.tracking_numbers || [])].filter(Boolean).map((x) => String(x).toLowerCase());
+        if (nums.includes(t)) return { order };
+      }
+    }
+  } catch (e) {}
+  return { order: null };
+}
+
 async function findOrderByContact(email, phone) {
   // Needs read_customers scope. Searches customer by email/phone, returns latest order.
   const parts = [];
@@ -449,15 +468,21 @@ async function findOrderByContact(email, phone) {
   } catch (e) { return { order: null }; }
 }
 
-async function lookupOrder({ orderId, phone, email }) {
+async function lookupOrder({ orderId, phone, email, tracking }) {
   if (!process.env.SHOPIFY_STORE || !process.env.SHOPIFY_ADMIN_TOKEN) return { ok: false, reason: "error" };
-  if (!orderId && !phone && !email) return { ok: false, reason: "need_any" };
+  if (!orderId && !phone && !email && !tracking) return { ok: false, reason: "need_any" };
 
   let order = null;
   if (orderId) {
     const found = await findOrderByNumber(orderId);
     if (found.error === "auth") return { ok: false, reason: "auth" };
     order = found.order;
+  }
+  if (!order && tracking) {
+    const found = await findOrderByTracking(tracking);
+    if (found.error === "auth") return { ok: false, reason: "auth" };
+    order = found.order;
+    if (!order) return { ok: false, reason: "tracking_not_found" };
   }
   if (!order && (email || phone)) {
     const r = await findOrderByContact(email, phone);
@@ -468,6 +493,21 @@ async function lookupOrder({ orderId, phone, email }) {
 
   const fulfilled = order.fulfillment_status === "fulfilled" || (order.fulfillments && order.fulfillments.length > 0);
   const items = (order.line_items || []).map((li) => li.title).slice(0, 5);
+
+  // Pull carrier + tracking info from the latest fulfillment that has it
+  let carrier = "", trackingNumber = "", trackingUrl = "";
+  const fs = order.fulfillments || [];
+  for (let i = fs.length - 1; i >= 0; i--) {
+    const f = fs[i];
+    const num = (f.tracking_numbers && f.tracking_numbers[0]) || f.tracking_number;
+    if (num) {
+      trackingNumber = String(num);
+      carrier = f.tracking_company || (f.tracking_companies && f.tracking_companies[0]) || "";
+      trackingUrl = (f.tracking_urls && f.tracking_urls[0]) || f.tracking_url || "";
+      break;
+    }
+  }
+
   return {
     ok: true,
     order: {
@@ -475,7 +515,12 @@ async function lookupOrder({ orderId, phone, email }) {
       financial_status: order.financial_status,
       fulfillment_status: order.fulfillment_status || "unfulfilled",
       shipped: !!fulfilled,
+      total: order.total_price || "",
+      currency: order.currency || "PKR",
       items,
+      carrier,
+      trackingNumber,
+      trackingUrl,
     },
   };
 }
@@ -553,11 +598,16 @@ export default async function handler(req, res) {
     if (body.track) {
       const r = await lookupOrder(body.track);
       if (r.ok) {
-        const itemsLine = r.order.items.length ? ` (${r.order.items.join(", ")})` : "";
-        const status = r.order.shipped ? "shipped" : (r.order.fulfillment_status || "processing");
+        const o = r.order;
+        const itemsLine = o.items.length ? ` (${o.items.join(", ")})` : "";
+        const status = o.shipped ? "shipped" : (o.fulfillment_status || "processing");
+        const totalLine = o.total ? ` Total: Rs ${o.total}.` : "";
+        const carrierLine = o.trackingNumber
+          ? ` Courier: ${o.carrier || "our courier"}, tracking #${o.trackingNumber}. Tap the button below to track.`
+          : (o.shipped ? " Tracking details will appear here once the courier scans it." : "");
         return res.status(200).json({
-          reply: `Order ${r.order.name}${itemsLine} — payment: ${r.order.financial_status}, status: ${status}.`,
-          order: r.order,
+          reply: `Order ${o.name}${itemsLine} — payment: ${o.financial_status}, status: ${status}.${totalLine}${carrierLine}`,
+          order: o,
           whatsappNumber: waNumber,
         });
       }
@@ -565,12 +615,12 @@ export default async function handler(req, res) {
         auth: "Order tracking isn't authorized yet. Please message us on WhatsApp and we'll check for you.",
         no_scope: "Order tracking isn't switched on yet. Please message us on WhatsApp and we'll check for you.",
         no_customer_scope: "Searching by phone/email isn't enabled. Please enter your order number instead.",
+        tracking_not_found: "I couldn't match that tracking number to an order. Please enter your Order number (e.g. #LM1234) instead, or message us on WhatsApp.",
         need_any: "Please enter your order number, phone, or email.",
         not_found: "I couldn't find an order with those details. Please double-check and try again.",
         error: "I couldn't check the order right now. Please try again shortly.",
       }[r.reason] || "I couldn't check the order right now.";
-      return res.status(200).json({ reply: msg, order: null, reason: r.reason, showCarriers: false, whatsappNumber: waNumber, callNumber });
-      return res.status(200).json({ reply: msg, order: null, showCarriers: true, whatsappNumber: waNumber, callNumber });
+      return res.status(200).json({ reply: msg, order: null, reason: r.reason, whatsappNumber: waNumber, callNumber });
     }
 
     const { messages } = body;
@@ -614,6 +664,11 @@ export default async function handler(req, res) {
     }
 
     const intentData = await detectIntent(messages);
+    // Safety net: clear browse/product phrases should always search products
+    if (intentData.intent === "other" &&
+        /\b(product|products|kids?|baby|clothes|romper|shirt|trouser|pant|fan|show|dikhao|chahiye|chahie|all products|everything)\b/i.test(lastMsg)) {
+      intentData.intent = "product";
+    }
     let products = [];
     let action = "none";
     let showCall = false;
@@ -631,34 +686,25 @@ export default async function handler(req, res) {
         results = catalog.filter((p) => p.discountPercent > 0)
           .sort((a, b) => b.discountPercent - a.discountPercent).slice(0, 20);
       } else {
-        // 1) collections (fast) for category names like "Azadi Sale"
-        results = await categorySearch(intentData.search_query);
-        if (!results) {
-          const catalog = await getCatalog();
-          const rawQ = lastMsg;                                 // exactly what the customer typed
-          const normQ = intentData.search_query || lastMsg;     // AI-cleaned (fixes typos/synonyms)
-          // 2) Shopify's own search engine — RAW first (accurate for specific names), then cleaned
-          results = await shopifySuggest(rawQ, catalog);
-          if (!results || !results.length) results = await shopifySuggest(normQ, catalog);
-          // narrow to the accurate product when the query strongly matches one
-          if (results && results.length) results = trimBySpecificity(rawQ, results);
-          // 3) fall back to our keyword+AI search if Shopify returns nothing
-          if (!results || !results.length) {
-            const base = keywordSearch(catalog, normQ);
-            if (base.length > 4) {
-              const refined = await aiPickProducts(base, normQ);
-              results = refined && refined.length ? refined : base;
-            } else {
-              results = base;
-            }
-          }
+        const catalog = await getCatalog();
+        const rawQ = lastMsg;                                 // exactly what the customer typed
+        const normQ = intentData.search_query || lastMsg;     // light typo help
+        // Shopify's own search engine (suggest.json) — finds the exact product the customer named
+        results = await shopifySuggest(rawQ, catalog);
+        if (!results || !results.length) results = await shopifySuggest(normQ, catalog);
+        // specific product query -> narrow to the accurate one; broad query -> keep many
+        if (results && results.length) results = trimBySpecificity(rawQ, results);
+        // Broad browse ("all products", "everything", "kids clothes") -> sample of the catalog
+        if ((!results || !results.length) && /\b(all|every|everything|sab|saray|sary|kids?|baby|clothes|products?|items?)\b/.test(q)) {
+          results = catalog.filter((p) => p.available).slice(0, 12);
         }
       }
       products = results || [];
       // Only show IN-STOCK products
       products = products.filter((p) => p.available);
       if (products.length) {
-        context = `Found ${products.length} matching products. In ONE short line, say you found some options and ask which they'd like. Do NOT list them (the cards show below).`;
+        const list = products.slice(0, 6).map((p) => `${p.title}${p.price ? " — Rs " + p.price : ""}`).join("; ");
+        context = `Products found (name — price): ${list}. Reply in ONE short line in the customer's language. If they asked about a specific product's price, state that product's price from this list. Otherwise just say something like "Here are some options for you 👇". NEVER ask which type or what kind. NEVER say a price is unavailable — the prices are shown on the cards.`;
       } else {
         action = "agent";
         context = `No matching products. In one short line say we don't have that right now, and they can chat with our team on WhatsApp (button below) or ask for something else. Do NOT invent products.`;
