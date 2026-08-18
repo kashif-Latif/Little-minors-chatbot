@@ -612,15 +612,18 @@ async function logChat(fields) {
       action: fields.action || "",
       ua: fields.ua || "",
     };
-    // Fire the request WITH keepalive so it completes even after the response is sent.
-    // We do NOT await it here — the caller starts it just before replying, so the chat stays fast.
-    return fetch(url, {
+    // Log write capped at 500ms: reliable, but can NEVER delay the reply by more than half a second.
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 500);
+    await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "text/plain;charset=utf-8" },  // text/plain = no CORS preflight
       body: JSON.stringify(payload),
       redirect: "follow",
       keepalive: true,
-    }).catch(() => {});   // ignore logging errors
+      signal: ctrl.signal,
+    }).catch(() => {});   // ignore logging errors/timeouts
+    clearTimeout(timer);
   } catch (e) {}
 }
 
@@ -628,7 +631,7 @@ export default async function handler(req, res) {
   setCors(res);
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method === "GET") {
-    return res.status(200).json({ ok: true, bot: "Bee Bot", version: "v11-reply-first", model: (process.env.GROQ_MODELS || "openai/gpt-oss-120b,llama-3.1-8b-instant"), logging: !!process.env.LOG_WEBHOOK_URL });
+    return res.status(200).json({ ok: true, bot: "Bee Bot", version: "v12-log-500ms", model: (process.env.GROQ_MODELS || "openai/gpt-oss-120b,llama-3.1-8b-instant"), logging: !!process.env.LOG_WEBHOOK_URL });
   }
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
@@ -772,8 +775,17 @@ export default async function handler(req, res) {
     const fallback = products.length
       ? "Here are some options for you 👇"
       : (action === "agent" ? "You can chat with our team on WhatsApp using the button below." : "How can I help you find something for your little one?");
-    // Reply to the customer FIRST (fast). Then fire the log (keepalive) — no waiting.
-    res.status(200).json({
+    // Log first (capped at 500ms so the reply is never delayed more than half a second),
+    // then send the reply — reliable logging, still fast.
+    await logChat({
+      store: "Bee Bot", session: body.session || "",
+      message: lastMsg, reply: reply || fallback,
+      intent: intentData.intent,
+      products: products.slice(0, 5).map((p) => p.title).join(" | "),
+      action, ua: (req.headers && req.headers["user-agent"]) || "",
+    });
+
+    return res.status(200).json({
       reply: reply || fallback,
       intent: intentData.intent,
       products,
@@ -782,15 +794,6 @@ export default async function handler(req, res) {
       callNumber: showCall ? callNumber : "",
       whatsappNumber: waNumber,
     });
-
-    logChat({
-      store: "Bee Bot", session: body.session || "",
-      message: lastMsg, reply: reply || fallback,
-      intent: intentData.intent,
-      products: products.slice(0, 5).map((p) => p.title).join(" | "),
-      action, ua: (req.headers && req.headers["user-agent"]) || "",
-    });
-    return;
   } catch (e) {
     const msg = String(e);
     if (msg.includes("401") || msg.toLowerCase().includes("invalid api key")) {
