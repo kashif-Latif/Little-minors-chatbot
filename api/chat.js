@@ -612,11 +612,14 @@ async function logChat(fields) {
       action: fields.action || "",
       ua: fields.ua || "",
     };
-    await fetch(url, {
+    // Fire the request WITH keepalive so it completes even after the response is sent.
+    // We do NOT await it here — the caller starts it just before replying, so the chat stays fast.
+    return fetch(url, {
       method: "POST",
       headers: { "Content-Type": "text/plain;charset=utf-8" },  // text/plain = no CORS preflight
       body: JSON.stringify(payload),
       redirect: "follow",
+      keepalive: true,
     }).catch(() => {});   // ignore logging errors
   } catch (e) {}
 }
@@ -625,7 +628,7 @@ export default async function handler(req, res) {
   setCors(res);
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method === "GET") {
-    return res.status(200).json({ ok: true, bot: "Bee Bot", version: "v9-log-reliable", model: (process.env.GROQ_MODELS || "openai/gpt-oss-120b,llama-3.1-8b-instant"), logging: !!process.env.LOG_WEBHOOK_URL });
+    return res.status(200).json({ ok: true, bot: "Bee Bot", version: "v10-log-fast", model: (process.env.GROQ_MODELS || "openai/gpt-oss-120b,llama-3.1-8b-instant"), logging: !!process.env.LOG_WEBHOOK_URL });
   }
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
@@ -770,9 +773,9 @@ export default async function handler(req, res) {
       ? "Here are some options for you 👇"
       : (action === "agent" ? "You can chat with our team on WhatsApp using the button below." : "How can I help you find something for your little one?");
 
-    // Log BEFORE sending the response so the write always completes on serverless.
-    // The script append is fast (well under a second) with the lightweight logger.
-    await logChat({
+    // Start the log (keepalive) just before replying — fast AND reliable on serverless.
+    
+    logChat({
       store: "Bee Bot", session: body.session || "",
       message: lastMsg, reply: reply || fallback,
       intent: intentData.intent,
