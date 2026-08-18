@@ -583,6 +583,20 @@ ${convo}`;
   } catch (e) { return { intent: "other", search_query: "" }; }
 }
 
+
+// ---- Chat logging to a Google Sheet (fire-and-forget; never blocks or breaks the chat) ----
+function logChat(fields) {
+  const url = process.env.LOG_WEBHOOK_URL;
+  if (!url) return;
+  try {
+    fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(fields),
+    }).catch(() => {});   // ignore logging errors
+  } catch (e) {}
+}
+
 export default async function handler(req, res) {
   setCors(res);
   if (req.method === "OPTIONS") return res.status(200).end();
@@ -728,6 +742,14 @@ export default async function handler(req, res) {
     const fallback = products.length
       ? "Here are some options for you 👇"
       : (action === "agent" ? "You can chat with our team on WhatsApp using the button below." : "How can I help you find something for your little one?");
+
+    logChat({
+      store: "Bee Bot", session: body.session || "",
+      message: lastMsg, reply: reply || fallback,
+      intent: intentData.intent,
+      products: products.slice(0, 5).map((p) => p.title).join(" | "),
+      action, ua: (req.headers && req.headers["user-agent"]) || "",
+    });
 
     return res.status(200).json({
       reply: reply || fallback,
