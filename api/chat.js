@@ -593,30 +593,30 @@ CURRENT message (classify + build search_query from THIS only): "${lastUser}"`;
 }
 
 
-// ---- Chat logging via SheetDB (fire-and-forget; never blocks or breaks the chat) ----
-// Works with a SheetDB API URL (https://sheetdb.io/api/v1/XXXX) in LOG_WEBHOOK_URL.
-// SheetDB expects { data: { <ColumnName>: value, ... } } with columns matching row 1 of the sheet.
+// ---- Chat logging to a Google Apps Script Web App (unlimited, free) ----
+// Put your Apps Script /exec URL in LOG_WEBHOOK_URL.
+// KEY FIX: send as text/plain (NOT application/json) so the browser/server skips the CORS
+// preflight that Apps Script cannot answer. The script still JSON.parses e.postData.contents.
+// We AWAIT so the serverless function isn't frozen before the write finishes.
 async function logChat(fields) {
   const url = process.env.LOG_WEBHOOK_URL;
   if (!url) return;
   try {
-    const row = {
-      "Timestamp": new Date().toISOString(),
-      "Store": fields.store || "",
-      "Session": fields.session || "",
-      "Customer Message": fields.message || "",
-      "Bot Reply": fields.reply || "",
-      "Intent": fields.intent || "",
-      "Products Shown": fields.products || "",
-      "Action": fields.action || "",
-      "User Agent": fields.ua || "",
+    const payload = {
+      store: fields.store || "",
+      session: fields.session || "",
+      message: fields.message || "",
+      reply: fields.reply || "",
+      intent: fields.intent || "",
+      products: fields.products || "",
+      action: fields.action || "",
+      ua: fields.ua || "",
     };
-    // Await the log write so the serverless function doesn't get frozen before it finishes.
-    // SheetDB is fast; this adds well under a second and guarantees the row is written.
     await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "Accept": "application/json" },
-      body: JSON.stringify({ data: row }),
+      headers: { "Content-Type": "text/plain;charset=utf-8" },  // text/plain = no CORS preflight
+      body: JSON.stringify(payload),
+      redirect: "follow",
     }).catch(() => {});   // ignore logging errors
   } catch (e) {}
 }
@@ -625,7 +625,7 @@ export default async function handler(req, res) {
   setCors(res);
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method === "GET") {
-    return res.status(200).json({ ok: true, bot: "Bee Bot", version: "v6-sheetdb-await", model: (process.env.GROQ_MODELS || "openai/gpt-oss-120b,llama-3.1-8b-instant"), logging: !!process.env.LOG_WEBHOOK_URL });
+    return res.status(200).json({ ok: true, bot: "Bee Bot", version: "v7-script-textplain", model: (process.env.GROQ_MODELS || "openai/gpt-oss-120b,llama-3.1-8b-instant"), logging: !!process.env.LOG_WEBHOOK_URL });
   }
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
