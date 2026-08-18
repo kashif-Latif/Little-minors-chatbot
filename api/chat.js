@@ -555,10 +555,13 @@ async function groqCall(messages, opts) {
 }
 
 async function detectIntent(messages) {
-  const convo = messages.slice(-6).map((m) => `${m.role}: ${m.content}`).join("\n");
+  const lastUser = ([...messages].reverse().find((m) => m.role === "user") || {}).content || "";
+  // Use only a little recent context (last 2 turns) so old products/topics don't pollute
+  // the search query later in a long conversation. The CURRENT message is what matters.
+  const convo = messages.slice(-2).map((m) => `${m.role}: ${m.content}`).join("\n");
   const NOUNS = "romper, bodysuit, onesie, trouser, pant, shorts, shirt, tee, tracksuit, jersy (jersey), suit, outfit, dress, kurta, nicker, pacifier, soother, teether, feeder, feeding bottle, bottle, brush, bib, fan, drone, aircraft, rc car, car, grooming kit, kit, blanket, mittens, cap, pajama, sleepwear, toy, romper, independence day, 14 august";
   const prompt = `You are the intent classifier + search normalizer for Little Minors, a baby & kids store in Pakistan.
-Classify the LAST customer message. Return ONLY JSON, no markdown:
+Classify the LAST customer message (shown as CURRENT below). Build search_query ONLY from the CURRENT message — ignore products or topics from earlier turns. Return ONLY JSON, no markdown:
 {"intent":"product|order_status|talk_to_agent|place_order|greeting|other","search_query":""}
 
 For "product" intent, build search_query using the store's product words below. IMPORTANT:
@@ -577,8 +580,10 @@ Intents:
 - "greeting": hi/hello/salaam/thanks only.
 - "other": unclear/gibberish (e.g. "ss") or general question with no product. Never guess a product here.
 
-Conversation:
-${convo}`;
+Recent context:
+${convo}
+
+CURRENT message (classify + build search_query from THIS only): "${lastUser}"`;
   try {
     const raw = await groqCall([{ role: "user", content: prompt }], { temperature: 0, max_tokens: 400 });
     const clean = raw.replace(/```json/gi, "").replace(/```/g, "").trim();
@@ -610,7 +615,7 @@ export default async function handler(req, res) {
   setCors(res);
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method === "GET") {
-    return res.status(200).json({ ok: true, bot: "Bee Bot", version: "v3-gptoss-fix", model: (process.env.GROQ_MODELS || "openai/gpt-oss-120b,llama-3.1-8b-instant"), logging: !!process.env.LOG_WEBHOOK_URL });
+    return res.status(200).json({ ok: true, bot: "Bee Bot", version: "v4-context-fix", model: (process.env.GROQ_MODELS || "openai/gpt-oss-120b,llama-3.1-8b-instant"), logging: !!process.env.LOG_WEBHOOK_URL });
   }
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
