@@ -13,7 +13,7 @@ function providerChain() {
   const groqKey = process.env.GROQ_API_KEY;
   const geminiKey = process.env.GEMINI_API_KEY;
   if (groqKey) {
-    for (const m of (process.env.GROQ_MODELS || "llama-3.3-70b-versatile,llama-3.1-8b-instant")
+    for (const m of (process.env.GROQ_MODELS || "openai/gpt-oss-120b,llama-3.1-8b-instant")
       .split(",").map((s) => s.trim()).filter(Boolean)) {
       chain.push({ url: "https://api.groq.com/openai/v1/chat/completions", key: groqKey, model: m });
     }
@@ -589,11 +589,16 @@ function logChat(fields) {
   const url = process.env.LOG_WEBHOOK_URL;
   if (!url) return;
   try {
+    // Non-blocking: short timeout so a slow logger can never delay the chat reply.
+    const ctrl = new AbortController();
+    setTimeout(() => ctrl.abort(), 1500);
     fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(fields),
-    }).catch(() => {});   // ignore logging errors
+      signal: ctrl.signal,
+      keepalive: true,
+    }).catch(() => {});   // ignore logging errors/timeouts
   } catch (e) {}
 }
 
