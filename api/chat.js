@@ -593,18 +593,30 @@ CURRENT message (classify + build search_query from THIS only): "${lastUser}"`;
 }
 
 
-// ---- Chat logging to a Google Sheet (fire-and-forget; never blocks or breaks the chat) ----
+// ---- Chat logging via SheetDB (fire-and-forget; never blocks or breaks the chat) ----
+// Works with a SheetDB API URL (https://sheetdb.io/api/v1/XXXX) in LOG_WEBHOOK_URL.
+// SheetDB expects { data: { <ColumnName>: value, ... } } with columns matching row 1 of the sheet.
 function logChat(fields) {
   const url = process.env.LOG_WEBHOOK_URL;
   if (!url) return;
   try {
-    // Non-blocking: short timeout so a slow logger can never delay the chat reply.
+    const row = {
+      "Timestamp": new Date().toISOString(),
+      "Store": fields.store || "",
+      "Session": fields.session || "",
+      "Customer Message": fields.message || "",
+      "Bot Reply": fields.reply || "",
+      "Intent": fields.intent || "",
+      "Products Shown": fields.products || "",
+      "Action": fields.action || "",
+      "User Agent": fields.ua || "",
+    };
     const ctrl = new AbortController();
-    setTimeout(() => ctrl.abort(), 1500);
+    setTimeout(() => ctrl.abort(), 2000);
     fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(fields),
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
+      body: JSON.stringify({ data: row }),
       signal: ctrl.signal,
       keepalive: true,
     }).catch(() => {});   // ignore logging errors/timeouts
@@ -615,7 +627,7 @@ export default async function handler(req, res) {
   setCors(res);
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method === "GET") {
-    return res.status(200).json({ ok: true, bot: "Bee Bot", version: "v4-context-fix", model: (process.env.GROQ_MODELS || "openai/gpt-oss-120b,llama-3.1-8b-instant"), logging: !!process.env.LOG_WEBHOOK_URL });
+    return res.status(200).json({ ok: true, bot: "Bee Bot", version: "v5-sheetdb", model: (process.env.GROQ_MODELS || "openai/gpt-oss-120b,llama-3.1-8b-instant"), logging: !!process.env.LOG_WEBHOOK_URL });
   }
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
