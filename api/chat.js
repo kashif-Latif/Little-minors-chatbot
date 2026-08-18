@@ -605,6 +605,9 @@ function logChat(fields) {
 export default async function handler(req, res) {
   setCors(res);
   if (req.method === "OPTIONS") return res.status(200).end();
+  if (req.method === "GET") {
+    return res.status(200).json({ ok: true, bot: "Bee Bot", version: "v2-gptoss-logging", model: (process.env.GROQ_MODELS || "openai/gpt-oss-120b,llama-3.1-8b-instant"), logging: !!process.env.LOG_WEBHOOK_URL });
+  }
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   const waNumber = process.env.WHATSAPP_NUMBER || "";
