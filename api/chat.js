@@ -398,7 +398,7 @@ From this short product list, return ONLY a JSON array of the index numbers that
 Products:
 ${list}`;
   try {
-    const raw = await groqCall([{ role: "user", content: prompt }], { temperature: 0, max_tokens: 80 });
+    const raw = await groqCall([{ role: "user", content: prompt }], { temperature: 0, max_tokens: 300 });
     const m = raw.replace(/```json/gi, "").replace(/```/g, "").trim().match(/\[[\s\S]*\]/);
     const arr = JSON.parse(m ? m[0] : "[]");
     if (!Array.isArray(arr)) return null;
@@ -526,15 +526,19 @@ async function lookupOrder({ orderId, phone, email, tracking }) {
 }
 
 async function groqCall(messages, opts) {
-  const { temperature = 0.5, max_tokens = 200 } = opts || {};
+  const { temperature = 0.5, max_tokens = 512 } = opts || {};
   const chain = providerChain();
   let lastErr = "";
   for (const p of chain) {
     try {
+      const payload = { model: p.model, messages, temperature, max_tokens };
+      // gpt-oss models are reasoning models; keep reasoning minimal so short replies
+      // aren't truncated and stay fast.
+      if (/gpt-oss/i.test(p.model)) payload.reasoning_effort = "low";
       const r = await fetch(p.url, {
         method: "POST",
         headers: { Authorization: `Bearer ${p.key}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ model: p.model, messages, temperature, max_tokens }),
+        body: JSON.stringify(payload),
       });
       if (r.status === 429) { lastErr = "429 rate limit"; continue; }   // busy -> next provider/model
       if (r.status === 401 || r.status === 403) { lastErr = "auth"; continue; } // bad key -> next provider
@@ -576,7 +580,7 @@ Intents:
 Conversation:
 ${convo}`;
   try {
-    const raw = await groqCall([{ role: "user", content: prompt }], { temperature: 0, max_tokens: 120 });
+    const raw = await groqCall([{ role: "user", content: prompt }], { temperature: 0, max_tokens: 400 });
     const clean = raw.replace(/```json/gi, "").replace(/```/g, "").trim();
     const p = JSON.parse(clean);
     return { intent: p.intent || "other", search_query: p.search_query || "" };
@@ -606,7 +610,7 @@ export default async function handler(req, res) {
   setCors(res);
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method === "GET") {
-    return res.status(200).json({ ok: true, bot: "Bee Bot", version: "v2-gptoss-logging", model: (process.env.GROQ_MODELS || "openai/gpt-oss-120b,llama-3.1-8b-instant"), logging: !!process.env.LOG_WEBHOOK_URL });
+    return res.status(200).json({ ok: true, bot: "Bee Bot", version: "v3-gptoss-fix", model: (process.env.GROQ_MODELS || "openai/gpt-oss-120b,llama-3.1-8b-instant"), logging: !!process.env.LOG_WEBHOOK_URL });
   }
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
@@ -789,7 +793,7 @@ async function shortReply(messages, context) {
         { role: "system", content: `Context: ${context}` },
         ...messages.slice(-6).map((m) => ({ role: m.role, content: m.content })),
       ],
-      { temperature: 0.5, max_tokens: 90 }
+      { temperature: 0.5, max_tokens: 400 }
     );
   } catch (e) { return ""; }
 }
