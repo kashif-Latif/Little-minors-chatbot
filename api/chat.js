@@ -628,7 +628,7 @@ export default async function handler(req, res) {
   setCors(res);
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method === "GET") {
-    return res.status(200).json({ ok: true, bot: "Bee Bot", version: "v10-log-fast", model: (process.env.GROQ_MODELS || "openai/gpt-oss-120b,llama-3.1-8b-instant"), logging: !!process.env.LOG_WEBHOOK_URL });
+    return res.status(200).json({ ok: true, bot: "Bee Bot", version: "v11-reply-first", model: (process.env.GROQ_MODELS || "openai/gpt-oss-120b,llama-3.1-8b-instant"), logging: !!process.env.LOG_WEBHOOK_URL });
   }
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
@@ -772,18 +772,8 @@ export default async function handler(req, res) {
     const fallback = products.length
       ? "Here are some options for you 👇"
       : (action === "agent" ? "You can chat with our team on WhatsApp using the button below." : "How can I help you find something for your little one?");
-
-    // Start the log (keepalive) just before replying — fast AND reliable on serverless.
-    
-    logChat({
-      store: "Bee Bot", session: body.session || "",
-      message: lastMsg, reply: reply || fallback,
-      intent: intentData.intent,
-      products: products.slice(0, 5).map((p) => p.title).join(" | "),
-      action, ua: (req.headers && req.headers["user-agent"]) || "",
-    });
-
-    return res.status(200).json({
+    // Reply to the customer FIRST (fast). Then fire the log (keepalive) — no waiting.
+    res.status(200).json({
       reply: reply || fallback,
       intent: intentData.intent,
       products,
@@ -792,6 +782,15 @@ export default async function handler(req, res) {
       callNumber: showCall ? callNumber : "",
       whatsappNumber: waNumber,
     });
+
+    logChat({
+      store: "Bee Bot", session: body.session || "",
+      message: lastMsg, reply: reply || fallback,
+      intent: intentData.intent,
+      products: products.slice(0, 5).map((p) => p.title).join(" | "),
+      action, ua: (req.headers && req.headers["user-agent"]) || "",
+    });
+    return;
   } catch (e) {
     const msg = String(e);
     if (msg.includes("401") || msg.toLowerCase().includes("invalid api key")) {
