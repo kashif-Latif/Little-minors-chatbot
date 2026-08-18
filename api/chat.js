@@ -625,7 +625,7 @@ export default async function handler(req, res) {
   setCors(res);
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method === "GET") {
-    return res.status(200).json({ ok: true, bot: "Bee Bot", version: "v7-script-textplain", model: (process.env.GROQ_MODELS || "openai/gpt-oss-120b,llama-3.1-8b-instant"), logging: !!process.env.LOG_WEBHOOK_URL });
+    return res.status(200).json({ ok: true, bot: "Bee Bot", version: "v8-fast-log", model: (process.env.GROQ_MODELS || "openai/gpt-oss-120b,llama-3.1-8b-instant"), logging: !!process.env.LOG_WEBHOOK_URL });
   }
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
@@ -770,15 +770,8 @@ export default async function handler(req, res) {
       ? "Here are some options for you 👇"
       : (action === "agent" ? "You can chat with our team on WhatsApp using the button below." : "How can I help you find something for your little one?");
 
-    await logChat({
-      store: "Bee Bot", session: body.session || "",
-      message: lastMsg, reply: reply || fallback,
-      intent: intentData.intent,
-      products: products.slice(0, 5).map((p) => p.title).join(" | "),
-      action, ua: (req.headers && req.headers["user-agent"]) || "",
-    });
-
-    return res.status(200).json({
+    // Send the reply to the customer FIRST (fast), then log in the background.
+    res.status(200).json({
       reply: reply || fallback,
       intent: intentData.intent,
       products,
@@ -787,6 +780,16 @@ export default async function handler(req, res) {
       callNumber: showCall ? callNumber : "",
       whatsappNumber: waNumber,
     });
+
+    // Background log — awaited AFTER the response is sent, so it never delays the chat.
+    await logChat({
+      store: "Bee Bot", session: body.session || "",
+      message: lastMsg, reply: reply || fallback,
+      intent: intentData.intent,
+      products: products.slice(0, 5).map((p) => p.title).join(" | "),
+      action, ua: (req.headers && req.headers["user-agent"]) || "",
+    });
+    return;
   } catch (e) {
     const msg = String(e);
     if (msg.includes("401") || msg.toLowerCase().includes("invalid api key")) {
