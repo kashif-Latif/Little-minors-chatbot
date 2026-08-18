@@ -596,7 +596,7 @@ CURRENT message (classify + build search_query from THIS only): "${lastUser}"`;
 // ---- Chat logging via SheetDB (fire-and-forget; never blocks or breaks the chat) ----
 // Works with a SheetDB API URL (https://sheetdb.io/api/v1/XXXX) in LOG_WEBHOOK_URL.
 // SheetDB expects { data: { <ColumnName>: value, ... } } with columns matching row 1 of the sheet.
-function logChat(fields) {
+async function logChat(fields) {
   const url = process.env.LOG_WEBHOOK_URL;
   if (!url) return;
   try {
@@ -611,15 +611,13 @@ function logChat(fields) {
       "Action": fields.action || "",
       "User Agent": fields.ua || "",
     };
-    const ctrl = new AbortController();
-    setTimeout(() => ctrl.abort(), 2000);
-    fetch(url, {
+    // Await the log write so the serverless function doesn't get frozen before it finishes.
+    // SheetDB is fast; this adds well under a second and guarantees the row is written.
+    await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json", "Accept": "application/json" },
       body: JSON.stringify({ data: row }),
-      signal: ctrl.signal,
-      keepalive: true,
-    }).catch(() => {});   // ignore logging errors/timeouts
+    }).catch(() => {});   // ignore logging errors
   } catch (e) {}
 }
 
@@ -627,7 +625,7 @@ export default async function handler(req, res) {
   setCors(res);
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method === "GET") {
-    return res.status(200).json({ ok: true, bot: "Bee Bot", version: "v5-sheetdb", model: (process.env.GROQ_MODELS || "openai/gpt-oss-120b,llama-3.1-8b-instant"), logging: !!process.env.LOG_WEBHOOK_URL });
+    return res.status(200).json({ ok: true, bot: "Bee Bot", version: "v6-sheetdb-await", model: (process.env.GROQ_MODELS || "openai/gpt-oss-120b,llama-3.1-8b-instant"), logging: !!process.env.LOG_WEBHOOK_URL });
   }
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
@@ -772,7 +770,7 @@ export default async function handler(req, res) {
       ? "Here are some options for you 👇"
       : (action === "agent" ? "You can chat with our team on WhatsApp using the button below." : "How can I help you find something for your little one?");
 
-    logChat({
+    await logChat({
       store: "Bee Bot", session: body.session || "",
       message: lastMsg, reply: reply || fallback,
       intent: intentData.intent,
