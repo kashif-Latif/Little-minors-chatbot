@@ -598,6 +598,47 @@ CURRENT message (classify + build search_query from THIS only): "${lastUser}"`;
 // KEY FIX: send as text/plain (NOT application/json) so the browser/server skips the CORS
 // preflight that Apps Script cannot answer. The script still JSON.parses e.postData.contents.
 // We AWAIT so the serverless function isn't frozen before the write finishes.
+// ---- Security layer: PII redaction, input sanitization, rate limiting ----
+
+// Mask personal info (phone, email, CNIC, long numbers) before it's stored in logs.
+function redactPII(text) {
+  if (!text) return "";
+  let t = String(text);
+  t = t.replace(/[\w.+-]+@[\w-]+\.[\w.-]+/g, "[email]");                 // emails
+  t = t.replace(/\b\d{5}-\d{7}-\d\b/g, "[cnic]");                        // Pakistani CNIC
+  t = t.replace(/(?:\+?92|0)?[\s-]?3\d{2}[\s-]?\d{7}\b/g, "[phone]");    // PK mobile numbers
+  t = t.replace(/\b\d{11,}\b/g, "[number]");                             // any long digit run
+  return t;
+}
+
+// Strip common prompt-injection / role-hijack patterns from user input before the AI sees it.
+function sanitizeInput(text) {
+  if (!text) return "";
+  let t = String(text);
+  // remove zero-width & control unicode used to smuggle instructions
+  t = t.replace(/[\u200B-\u200F\u202A-\u202E\u2060\uFEFF]/g, "");
+  // neutralize obvious injection phrases (kept as plain text, just defanged)
+  t = t.replace(/ignore (all|previous|the above)[^.]*/gi, "");
+  t = t.replace(/disregard (all|previous|the above)[^.]*/gi, "");
+  t = t.replace(/you are now[^.]*/gi, "");
+  t = t.replace(/system prompt|developer message|reveal your (rules|prompt|instructions)/gi, "");
+  return t.slice(0, 500);   // hard cap message length
+}
+
+// Simple in-memory rate limit per session (cost + abuse control). Resets on cold start.
+const RL = new Map();
+const RL_MAX = 20;                 // messages
+const RL_WINDOW = 60 * 1000;       // per 60 seconds
+function rateLimited(key) {
+  if (!key) return false;
+  const now = Date.now();
+  const rec = RL.get(key) || { n: 0, t: now };
+  if (now - rec.t > RL_WINDOW) { rec.n = 0; rec.t = now; }
+  rec.n++;
+  RL.set(key, rec);
+  return rec.n > RL_MAX;
+}
+
 async function logChat(fields) {
   const url = process.env.LOG_WEBHOOK_URL;
   if (!url) return;
@@ -605,8 +646,8 @@ async function logChat(fields) {
     const payload = {
       store: fields.store || "",
       session: fields.session || "",
-      message: fields.message || "",
-      reply: fields.reply || "",
+      message: redactPII(fields.message || ""),
+      reply: redactPII(fields.reply || ""),
       intent: fields.intent || "",
       products: fields.products || "",
       action: fields.action || "",
@@ -631,7 +672,7 @@ export default async function handler(req, res) {
   setCors(res);
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method === "GET") {
-    return res.status(200).json({ ok: true, bot: "Bee Bot", version: "v13-guardrail", model: (process.env.GROQ_MODELS || "openai/gpt-oss-120b,llama-3.1-8b-instant"), logging: !!process.env.LOG_WEBHOOK_URL });
+    return res.status(200).json({ ok: true, bot: "Bee Bot", version: "v14-security", model: (process.env.GROQ_MODELS || "openai/gpt-oss-120b,llama-3.1-8b-instant"), logging: !!process.env.LOG_WEBHOOK_URL });
   }
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
@@ -640,6 +681,12 @@ export default async function handler(req, res) {
 
   try {
     const body = req.body || {};
+
+    // Rate limit per session (abuse + cost control)
+    const rlKey = (body.session || "") + "|" + ((req.headers && (req.headers["x-forwarded-for"] || req.headers["x-real-ip"])) || "");
+    if (rateLimited(rlKey)) {
+      return res.status(200).json({ reply: "You're sending messages very fast — please wait a moment and try again 🙂", products: [], action: "none", whatsappNumber: waNumber });
+    }
 
     // ---- Verified order tracking from the tracking form ----
     if (body.track) {
@@ -673,6 +720,11 @@ export default async function handler(req, res) {
     const { messages } = body;
     if (!Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json({ error: "messages array required" });
+    }
+
+    // Input defense: strip injection patterns + hidden unicode, cap length, on EVERY message.
+    for (const m of messages) {
+      if (m && m.role === "user" && typeof m.content === "string") m.content = sanitizeInput(m.content);
     }
 
     const lastMsg = ([...messages].reverse().find((m) => m.role === "user") || {}).content || "";
