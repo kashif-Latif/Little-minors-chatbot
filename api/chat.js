@@ -269,7 +269,7 @@ async function categorySearch(query) {
 function trimBySpecificity(query, results) {
   if (!results || !results.length) return results || [];
   const n = keywords(query).length;   // number of meaningful words the customer typed
-  if (n >= 6) return results.slice(0, 1);    // full product-name paste -> the one accurate product
+  if (n >= 6) return results.slice(0, 3);    // full product-name paste -> top match(es), not just one
   if (n === 5) return results.slice(0, 4);   // fairly specific -> a few
   return results.slice(0, 10);               // short/browse query ("lipstick", "boys pants") -> more
 }
@@ -672,7 +672,7 @@ export default async function handler(req, res) {
   setCors(res);
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method === "GET") {
-    return res.status(200).json({ ok: true, bot: "Bee Bot", version: "v14-security", model: (process.env.GROQ_MODELS || "openai/gpt-oss-120b,llama-3.1-8b-instant"), logging: !!process.env.LOG_WEBHOOK_URL });
+    return res.status(200).json({ ok: true, bot: "Bee Bot", version: "v15-search-fix", model: (process.env.GROQ_MODELS || "openai/gpt-oss-120b,llama-3.1-8b-instant"), logging: !!process.env.LOG_WEBHOOK_URL });
   }
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
@@ -791,6 +791,16 @@ export default async function handler(req, res) {
         // Shopify's own search engine (suggest.json) — finds the exact product the customer named
         results = await shopifySuggest(rawQ, catalog);
         if (!results || !results.length) results = await shopifySuggest(normQ, catalog);
+        // Long pasted product titles often return nothing from suggest.json (too many terms).
+        // Retry with the most distinctive words, then with our own keyword search.
+        if (!results || !results.length) {
+          const kws = keywords(rawQ);
+          if (kws.length > 4) {
+            results = await shopifySuggest(kws.slice(0, 4).join(" "), catalog);
+            if (!results || !results.length) results = await shopifySuggest(kws.slice(0, 2).join(" "), catalog);
+          }
+        }
+        if (!results || !results.length) results = keywordSearch(catalog, rawQ);
         // specific product query -> narrow to the accurate one; broad query -> keep many
         if (results && results.length) results = trimBySpecificity(rawQ, results);
         // Broad browse ("all products", "everything", "kids clothes") -> sample of the catalog
